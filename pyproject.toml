@@ -1,0 +1,28 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "teasel"
+version = "0.0.1"
+description = "Connect lab instruments to AI assistants"
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Lucas Gerads", email = "lucas.gerads@gmail.com" }]
+keywords = ["lab", "instruments", "mcp", "gpib", "automation"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering",
+]
+
+[project.urls]
+Homepage = "https://teasel.tools"
+Repository = "https://github.com/teasel-tools/teasel"
+
+[project.scripts]
+teasel = "teasel.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/teasel"]
