@@ -1,0 +1,89 @@
+name: Release and publish to PyPI
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - teasel-cli/pyproject.toml
+      - teasel-server/pyproject.toml
+      - drivers/lecroy-wavesurfer/pyproject.toml
+      - drivers/pm5190/pyproject.toml
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: write
+      id-token: write  # required for trusted publishing
+
+    strategy:
+      matrix:
+        include:
+          - package: teasel
+            path: teasel-cli
+            tag_prefix: teasel-v
+          - package: teasel-server
+            path: teasel-server
+            tag_prefix: server-v
+          - package: lecroy-wavesurfer-driver
+            path: drivers/lecroy-wavesurfer
+            tag_prefix: lecroy-v
+          - package: pm5190-driver
+            path: drivers/pm5190
+            tag_prefix: pm5190-v
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check if this package's pyproject.toml was changed
+        id: changed
+        run: |
+          if git diff --name-only HEAD~1 HEAD | grep -q "^${{ matrix.path }}/pyproject.toml$"; then
+            echo "changed=true" >> $GITHUB_OUTPUT
+          else
+            echo "changed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Read version
+        if: steps.changed.outputs.changed == 'true'
+        id: version
+        run: |
+          VERSION=$(grep '^version' ${{ matrix.path }}/pyproject.toml | head -1 | sed 's/.*= *"\(.*\)"/\1/')
+          echo "version=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Check if tag already exists
+        if: steps.changed.outputs.changed == 'true'
+        id: tag_check
+        run: |
+          TAG="${{ matrix.tag_prefix }}${{ steps.version.outputs.version }}"
+          if git ls-remote --tags origin "refs/tags/$TAG" | grep -q .; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
+        with:
+          python-version: "3.12"
+
+      - name: Build
+        if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
+        run: |
+          pip install build
+          python -m build ${{ matrix.path }}
+
+      - name: Publish to PyPI
+        if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: Create GitHub release
+        if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ matrix.tag_prefix }}${{ steps.version.outputs.version }}"
+          gh release create "$TAG" \
+            --title "${{ matrix.package }} ${{ steps.version.outputs.version }}" \
+            --generate-notes

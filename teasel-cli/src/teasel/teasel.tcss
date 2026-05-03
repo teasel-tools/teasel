@@ -1,0 +1,59 @@
+Screen {
+    background: $surface;
+}
+
+#search {
+    dock: top;
+    margin: 0 0 1 0;
+}
+
+#wizard-title {
+    margin: 1 0;
+    text-style: bold;
+}
+
+#param-fields {
+    height: 1fr;
+    padding: 0 1;
+}
+
+.param-input {
+    margin-bottom: 0;
+}
+
+.error-label {
+    color: $error;
+    height: 1;
+    margin-bottom: 1;
+}
+
+#btn-save {
+    margin: 1 0;
+    dock: bottom;
+}
+
+SuccessScreen {
+    align: center middle;
+}
+
+#success-dialog {
+    width: 60;
+    height: auto;
+    border: round $success;
+    padding: 2 4;
+    background: $surface;
+}
+
+#success-title {
+    text-style: bold;
+    margin-bottom: 1;
+}
+
+#success-path {
+    color: $text-muted;
+    margin-bottom: 1;
+}
+
+#btn-done {
+    margin-top: 1;
+}
