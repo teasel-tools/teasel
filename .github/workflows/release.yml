@@ -6,8 +6,6 @@ on:
     paths:
       - teasel-cli/pyproject.toml
       - teasel-server/pyproject.toml
-      - drivers/lecroy-wavesurfer/pyproject.toml
-      - drivers/pm5190/pyproject.toml
 
 jobs:
   publish:
@@ -26,12 +24,6 @@ jobs:
           - package: teasel-server
             path: teasel-server
             tag_prefix: server-v
-          - package: lecroy-wavesurfer-driver
-            path: drivers/lecroy-wavesurfer
-            tag_prefix: lecroy-v
-          - package: pm5190-driver
-            path: drivers/pm5190
-            tag_prefix: pm5190-v
 
     steps:
       - uses: actions/checkout@v4
