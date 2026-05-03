@@ -111,10 +111,14 @@ class InstrumentDetailScreen(Screen):
 
     def _render_detail(self) -> None:
         d = self.driver
+        if d.package == "teasel-server":
+            pkg_line = "Driver: [green]bundled in teasel-server[/]"
+        else:
+            pkg_line = f"Driver: [dim]uvx --with {d.package} teasel-server[/]"
         lines = [
             f"[bold]{d.name}[/] — {d.manufacturer}",
             f"Type: [cyan]{d.type}[/]  |  Interfaces: {', '.join(d.interfaces)}",
-            f"Package: [dim]{d.package}[/]",
+            pkg_line,
         ]
         if d.manual:
             lines.append(f"Manual: {d.manual}")
