@@ -69,6 +69,8 @@ jobs:
       - name: Publish to PyPI
         if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
         uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          packages-dir: ${{ matrix.path }}/dist/
 
       - name: Create GitHub release
         if: steps.changed.outputs.changed == 'true' && steps.tag_check.outputs.exists == 'false'
