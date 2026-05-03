@@ -20,12 +20,15 @@ def apply(instruments: list[InstalledInstrument], output_dir: Path | None = None
     if not instruments:
         servers.pop("lab", None)
     else:
-        args: list[str] = []
         env: dict[str, str] = {}
+        extra_packages: list[str] = []
+        seen: set[str] = set()
         for inst in instruments:
-            args += ["--with", inst.package]
             env.update(inst.env)
-        args.append("teasel-server")
+            if inst.package != "teasel-server" and inst.package not in seen:
+                extra_packages.append(inst.package)
+                seen.add(inst.package)
+        args = [item for pkg in extra_packages for item in ("--with", pkg)] + ["teasel-server"]
         servers["lab"] = {"command": "uvx", "args": args, "env": env}
 
     path.write_text(json.dumps(existing, indent=2) + "\n")
