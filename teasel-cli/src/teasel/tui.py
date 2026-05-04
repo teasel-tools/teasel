@@ -153,8 +153,14 @@ class ConfigWizardScreen(Screen):
             for param in self.driver.params:
                 required_mark = " [red]*[/]" if param.required else ""
                 yield Label(f"[bold]{param.key}[/]{required_mark}  {param.description}")
+                if param.default is not None:
+                    prefill = param.default
+                elif param.required:
+                    prefill = param.example or ""
+                else:
+                    prefill = ""
                 yield Input(
-                    value=param.default or param.example or "",
+                    value=prefill,
                     placeholder=param.example or "",
                     id=f"param-{param.key}",
                     classes="param-input",
@@ -177,12 +183,11 @@ class ConfigWizardScreen(Screen):
         for param in self.driver.params:
             widget = self.query_one(f"#param-{param.key}", Input)
             value = widget.value.strip()
-            if value:
+            if not value:
+                if param.required:
+                    missing.append(param.key)
+            elif value != param.default:
                 env[param.key] = value
-            elif param.default is not None:
-                env[param.key] = param.default
-            elif param.required:
-                missing.append(param.key)
 
         if missing:
             for key in missing:
