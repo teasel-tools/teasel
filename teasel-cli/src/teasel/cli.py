@@ -1,3 +1,4 @@
+from importlib.metadata import version
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -18,7 +19,13 @@ app = typer.Typer(
 
 
 @app.callback(invoke_without_command=True)
-def _root(ctx: typer.Context) -> None:
+def _root(
+    ctx: typer.Context,
+    ver: bool = typer.Option(False, "--version", "-V", is_eager=True, help="Show version and exit."),
+) -> None:
+    if ver:
+        typer.echo(version("teasel"))
+        raise typer.Exit()
     if ctx.invoked_subcommand is None:
         from .tui import run_tui
         run_tui()
