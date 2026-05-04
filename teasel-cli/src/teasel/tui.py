@@ -154,7 +154,7 @@ class ConfigWizardScreen(Screen):
                 required_mark = " [red]*[/]" if param.required else ""
                 yield Label(f"[bold]{param.key}[/]{required_mark}  {param.description}")
                 yield Input(
-                    value=param.default or "",
+                    value=param.default or param.example or "",
                     placeholder=param.example or "",
                     id=f"param-{param.key}",
                     classes="param-input",
