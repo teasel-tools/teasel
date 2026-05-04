@@ -183,11 +183,12 @@ class ConfigWizardScreen(Screen):
         for param in self.driver.params:
             widget = self.query_one(f"#param-{param.key}", Input)
             value = widget.value.strip()
-            if not value:
-                if param.required:
-                    missing.append(param.key)
-            elif value != param.default:
+            if value:
                 env[param.key] = value
+            elif param.default is not None:
+                env[param.key] = param.default
+            elif param.required:
+                missing.append(param.key)
 
         if missing:
             for key in missing:
