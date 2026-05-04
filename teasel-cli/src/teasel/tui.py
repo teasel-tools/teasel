@@ -140,7 +140,7 @@ class ConfigWizardScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back"),
         Binding("ctrl+s", "submit", "Save"),
-        Binding("ctrl+e", "fill_example", "Fill example"),
+        Binding("f2", "fill_example", "Fill example"),
     ]
 
     def __init__(self, driver: DriverDescriptor) -> None:
