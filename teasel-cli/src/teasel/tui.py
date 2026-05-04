@@ -140,6 +140,7 @@ class ConfigWizardScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back"),
         Binding("ctrl+s", "submit", "Save"),
+        Binding("ctrl+e", "fill_example", "Fill example"),
     ]
 
     def __init__(self, driver: DriverDescriptor) -> None:
@@ -168,6 +169,15 @@ class ConfigWizardScreen(Screen):
                 yield Label("", id=f"err-{param.key}", classes="error-label")
         yield Button("Save to .mcp.json", id="btn-save", variant="primary")
         yield Footer()
+
+    def action_fill_example(self) -> None:
+        focused = self.focused
+        if not isinstance(focused, Input) or not focused.id or not focused.id.startswith("param-"):
+            return
+        key = focused.id[len("param-"):]
+        param = next((p for p in self.driver.params if p.key == key), None)
+        if param and param.example:
+            focused.value = param.example
 
     def action_submit(self) -> None:
         self._save()
