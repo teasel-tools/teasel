@@ -31,6 +31,29 @@ Community instruments are listed in the [instruments registry](https://github.co
 
 Any Python package can add instruments to `teasel-server` by registering a `teasel.instruments` entry point. No changes to this repo required.
 
+## Development
+
+This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/workspaces/). Both packages share a single venv.
+
+**Setup:**
+```bash
+uv sync --all-packages
+```
+
+**Run:**
+```bash
+uv run teasel         # CLI / TUI
+uv run teasel web     # Web UI (http://127.0.0.1:7890)
+uv run teasel-server  # MCP server
+```
+
+**Test against the local instruments registry instead of GitHub:**
+```bash
+TEASEL_REGISTRY=/path/to/instruments uv run teasel
+```
+
+**Release:** Bump `version` in the relevant `pyproject.toml` and push to `main`. CI publishes that package to PyPI automatically via trusted publishing. Each package is released independently.
+
 ## License
 
 AGPL v3. See [LICENSE](LICENSE).
