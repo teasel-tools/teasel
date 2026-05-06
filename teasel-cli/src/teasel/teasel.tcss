@@ -32,6 +32,23 @@ Screen {
     dock: bottom;
 }
 
+DiscoveryPickerScreen {
+    align: center middle;
+}
+
+#picker-dialog {
+    width: 60;
+    height: auto;
+    max-height: 20;
+    border: round $accent;
+    padding: 1 2;
+    background: $surface;
+}
+
+#picker-dialog Label {
+    margin-bottom: 1;
+}
+
 SuccessScreen {
     align: center middle;
 }

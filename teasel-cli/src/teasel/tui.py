@@ -6,7 +6,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, ScrollableContainer
 from textual.screen import ModalScreen, Screen
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ListItem, ListView
 
 from . import config as cfg
 from . import state as st
@@ -136,10 +136,37 @@ class InstrumentDetailScreen(Screen):
             self.app.push_screen(ConfigWizardScreen(self.driver))
 
 
+def _list_serial_ports() -> list[str]:
+    from serial.tools.list_ports import comports
+    return sorted(p.device for p in comports())
+
+
+class DiscoveryPickerScreen(ModalScreen):
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
+
+    def __init__(self, ports: list[str]) -> None:
+        super().__init__()
+        self.ports = ports
+
+    def compose(self) -> ComposeResult:
+        with Container(id="picker-dialog"):
+            yield Label("Select a serial port:")
+            yield ListView(
+                *[ListItem(Label(p), id=f"port-{i}") for i, p in enumerate(self.ports)],
+                id="port-list",
+            )
+
+    @on(ListView.Selected, "#port-list")
+    def port_selected(self, event: ListView.Selected) -> None:
+        idx = int(event.item.id.split("-")[1])
+        self.dismiss(self.ports[idx])
+
+
 class ConfigWizardScreen(Screen):
     BINDINGS = [
         Binding("escape", "pop_screen", "Back"),
         Binding("ctrl+s", "submit", "Save"),
+        Binding("f1", "discover", "Discover"),
         Binding("f2", "fill_example", "Fill example"),
     ]
 
@@ -169,6 +196,26 @@ class ConfigWizardScreen(Screen):
                 yield Label("", id=f"err-{param.key}", classes="error-label")
         yield Button("Save to .mcp.json", id="btn-save", variant="primary")
         yield Footer()
+
+    def action_discover(self) -> None:
+        focused = self.focused
+        if not isinstance(focused, Input) or not focused.id or not focused.id.startswith("param-"):
+            return
+        key = focused.id[len("param-"):]
+        param = next((p for p in self.driver.params if p.key == key), None)
+        if not param or param.discovery != "serial-ports":
+            self.notify("No discovery available for this field")
+            return
+        ports = _list_serial_ports()
+        if not ports:
+            self.notify("No serial ports found", severity="warning")
+        elif len(ports) == 1:
+            focused.value = ports[0]
+        else:
+            def _pick(port: str | None) -> None:
+                if port:
+                    focused.value = port
+            self.app.push_screen(DiscoveryPickerScreen(ports), _pick)
 
     def action_fill_example(self) -> None:
         focused = self.focused

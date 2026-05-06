@@ -16,6 +16,7 @@ class ConfigParam:
     type: str = "string"
     example: str | None = None
     default: str | None = None
+    discovery: str | None = None
 
 
 @dataclass
@@ -90,6 +91,7 @@ def fetch_driver(slug: str) -> DriverDescriptor:
             type=p.get("type", "string"),
             example=str(p["example"]) if "example" in p else None,
             default=str(p["default"]) if "default" in p else None,
+            discovery=p.get("discovery"),
         )
         for p in doc.get("config", {}).get("params", [])
     ]
