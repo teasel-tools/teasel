@@ -119,5 +119,16 @@ def apply(
     console.print(f"[green]✓[/] Written to [bold]{path}[/] ({n} instrument{'s' if n != 1 else ''})")
 
 
+@app.command()
+def web(
+    host: str = typer.Option("127.0.0.1", "--host", help="Host to bind to"),
+    port: int = typer.Option(7890, "--port", "-p", help="Port to listen on"),
+) -> None:
+    """Start the teasel web UI."""
+    import uvicorn
+    console.print(f"Starting teasel web UI at [link]http://{host}:{port}[/link]")
+    uvicorn.run("teasel.web:app", host=host, port=port, reload=False)
+
+
 def main() -> None:
     app()
