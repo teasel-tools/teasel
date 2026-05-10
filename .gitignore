@@ -4,3 +4,8 @@ __pycache__/
 dist/
 build/
 .venv/
+.mcp.json
+setup.toml
+teasel.log
+teasel.toml
+

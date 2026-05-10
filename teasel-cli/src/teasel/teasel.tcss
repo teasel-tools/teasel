@@ -2,9 +2,15 @@ Screen {
     background: $surface;
 }
 
-#search {
+Header {
     dock: top;
-    margin: 0 0 1 0;
+    height: 1;
+    background: $primary;
+    color: $text;
+}
+
+#search {
+    margin: 1 0 1 0;
 }
 
 #wizard-title {
@@ -32,6 +38,17 @@ Screen {
     dock: bottom;
 }
 
+#btn-row {
+    layout: horizontal;
+    height: auto;
+    dock: bottom;
+    margin: 1 0;
+}
+
+#btn-row Button {
+    margin-right: 1;
+}
+
 DiscoveryPickerScreen {
     align: center middle;
 }
@@ -47,6 +64,28 @@ DiscoveryPickerScreen {
 
 #picker-dialog Label {
     margin-bottom: 1;
+}
+
+.setup-section {
+    text-style: bold;
+    margin-top: 1;
+}
+
+.section-spacer {
+    height: 1;
+}
+
+.probe-row {
+    layout: horizontal;
+    height: auto;
+}
+
+.probe-input {
+    width: 12;
+}
+
+.label-input {
+    width: 1fr;
 }
 
 SuccessScreen {

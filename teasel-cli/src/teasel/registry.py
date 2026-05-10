@@ -17,6 +17,7 @@ class ConfigParam:
     example: str | None = None
     default: str | None = None
     discovery: str | None = None
+    param: str | None = None  # friendly name used in teasel.toml
 
 
 @dataclass
@@ -92,6 +93,7 @@ def fetch_driver(slug: str) -> DriverDescriptor:
             example=str(p["example"]) if "example" in p else None,
             default=str(p["default"]) if "default" in p else None,
             discovery=p.get("discovery"),
+            param=p.get("param"),
         )
         for p in doc.get("config", {}).get("params", [])
     ]

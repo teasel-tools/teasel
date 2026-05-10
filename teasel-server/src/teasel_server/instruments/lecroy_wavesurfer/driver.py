@@ -20,6 +20,7 @@ class LecroyWaveSurferDriver(OscilloscopeBase, FunctionGeneratorBase):
     slug = "lecroy-wavesurfer"
     name = "LeCroy WaveSurfer"
     waveforms = ["Sine", "Square", "Triangle", "Pulse", "DC", "Noise", "Arb"]
+    PARAM_MAP = {"host": "LECROY_HOST", "resource": "LECROY_RESOURCE"}
 
     def __init__(self, config: dict):
         self._scope = LeCroyScope()

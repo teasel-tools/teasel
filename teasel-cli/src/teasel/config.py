@@ -1,17 +1,19 @@
 import json
 from pathlib import Path
 
-from .state import InstalledInstrument
+from .state import InstrumentConfig, SETUP_TOML
 
 
-def apply(instruments: list[InstalledInstrument], output_dir: Path | None = None) -> Path:
+def apply(instruments: list[InstrumentConfig], output_dir: Path | None = None) -> Path:
     output_dir = output_dir or Path.cwd()
-    path = output_dir / ".mcp.json"
+    mcp_path = output_dir / ".mcp.json"
+    config_path = (output_dir / "teasel.toml").resolve()
+    setup_path = (output_dir / SETUP_TOML).resolve()
 
     existing: dict = {}
-    if path.exists():
+    if mcp_path.exists():
         try:
-            existing = json.loads(path.read_text())
+            existing = json.loads(mcp_path.read_text())
         except json.JSONDecodeError:
             pass
 
@@ -20,16 +22,16 @@ def apply(instruments: list[InstalledInstrument], output_dir: Path | None = None
     if not instruments:
         servers.pop("lab", None)
     else:
-        env: dict[str, str] = {}
         extra_packages: list[str] = []
         seen: set[str] = set()
         for inst in instruments:
-            env.update(inst.env)
             if inst.package != "teasel-server" and inst.package not in seen:
                 extra_packages.append(inst.package)
                 seen.add(inst.package)
-        args = [item for pkg in extra_packages for item in ("--with", pkg)] + ["teasel-server"]
-        servers["lab"] = {"command": "uvx", "args": args, "env": env}
 
-    path.write_text(json.dumps(existing, indent=2) + "\n")
-    return path
+        args = [item for pkg in extra_packages for item in ("--with", pkg)]
+        args += ["teasel-server", "--config", str(config_path), "--setup", str(setup_path)]
+        servers["lab"] = {"command": "uvx", "args": args}
+
+    mcp_path.write_text(json.dumps(existing, indent=2) + "\n")
+    return mcp_path

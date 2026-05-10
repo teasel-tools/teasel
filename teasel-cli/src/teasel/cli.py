@@ -1,4 +1,4 @@
-from importlib.metadata import version
+from . import get_version
 from pathlib import Path
 from typing import Annotated, Optional
 
@@ -24,7 +24,7 @@ def _root(
     ver: bool = typer.Option(False, "--version", "-V", is_eager=True, help="Show version and exit."),
 ) -> None:
     if ver:
-        typer.echo(version("teasel"))
+        typer.echo(get_version())
         raise typer.Exit()
     if ctx.invoked_subcommand is None:
         from .tui import run_tui
@@ -57,18 +57,21 @@ def add(
         k, v = s.split("=", 1)
         provided[k] = v
 
-    env: dict[str, str] = {}
+    params: dict[str, str] = {}
     for param in driver.params:
+        param_name = param.param or param.key.lower()
         if param.key in provided:
-            env[param.key] = provided[param.key]
+            params[param_name] = provided[param.key]
+        elif param_name in provided:
+            params[param_name] = provided[param_name]
         elif param.default is not None:
-            env[param.key] = provided.get(param.key, param.default)
+            params[param_name] = param.default
         elif param.required:
             hint = f" (e.g. {param.example})" if param.example else ""
-            env[param.key] = typer.prompt(f"{param.description}{hint}")
+            params[param_name] = typer.prompt(f"{param.description}{hint}")
 
     instruments = [i for i in st.load() if i.slug != slug]
-    instruments.append(st.InstalledInstrument(slug=slug, package=driver.package, env=env))
+    instruments.append(st.InstrumentConfig(slug=slug, package=driver.package, params=params))
     st.save(instruments)
 
     path = cfg.apply(instruments, output)
@@ -103,7 +106,7 @@ def list_instruments() -> None:
     table.add_column("Package")
     table.add_column("Config")
     for inst in instruments:
-        config_str = ", ".join(f"{k}={v}" for k, v in inst.env.items()) or "—"
+        config_str = ", ".join(f"{k}={v}" for k, v in inst.params.items()) or "—"
         table.add_row(inst.slug, inst.package, config_str)
     console.print(table)
 
