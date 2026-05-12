@@ -995,12 +995,13 @@ wheels = [
 
 [[package]]
 name = "teasel"
-version = "0.2.13"
+version = "0.2.15"
 source = { editable = "teasel-cli" }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
     { name = "pyserial" },
+    { name = "python-multipart" },
     { name = "rich" },
     { name = "textual" },
     { name = "typer" },
@@ -1012,6 +1013,7 @@ requires-dist = [
     { name = "fastapi", specifier = ">=0.110" },
     { name = "httpx", specifier = ">=0.27" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "python-multipart", specifier = ">=0.0.9" },
     { name = "rich", specifier = ">=13" },
     { name = "textual", specifier = ">=0.70" },
     { name = "typer", specifier = ">=0.12" },
@@ -1020,7 +1022,7 @@ requires-dist = [
 
 [[package]]
 name = "teasel-server"
-version = "0.1.7"
+version = "0.1.8"
 source = { editable = "teasel-server" }
 dependencies = [
     { name = "mcp", extra = ["cli"] },

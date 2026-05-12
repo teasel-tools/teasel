@@ -1,6 +1,9 @@
 """Web UI for teasel — FastAPI + htmx + Pico CSS."""
 
 import asyncio
+import re
+import subprocess
+from pathlib import Path
 
 from fastapi import FastAPI, Request
 from fastapi.responses import HTMLResponse, RedirectResponse
@@ -262,9 +265,14 @@ def instrument_detail(slug: str, saved: str = "") -> HTMLResponse:
 
     <hr style="margin-top:2rem">
 
-    <div style="display:flex; align-items:baseline; gap:1rem; margin-bottom:.5rem; margin-top:1.5rem">
+    <div style="display:flex; align-items:center; gap:1rem; margin-bottom:.5rem; margin-top:1.5rem">
       <h3 style="margin:0">Connection</h3>
       <a href="/instrument/{slug}/connection">Edit</a>
+      <button hx-post="/instrument/{slug}/ping" hx-swap="none"
+              hx-on:htmx:before-request="clearInterval(window._pingIv);var e=document.getElementById('ping-result'),n=0;e.textContent='·';window._pingIv=setInterval(function(){{n=(n+1)%3;e.textContent='···'.slice(0,n+1)}},400)"
+              hx-on:htmx:after-request="clearInterval(window._pingIv);document.getElementById('ping-result').innerHTML=event.detail.xhr.responseText"
+              style="width:auto;margin:0;padding:.2rem .75rem;font-size:.8rem">Ping</button>
+      <span id="ping-result" class="muted" style="font-size:.85rem"></span>
     </div>
     <table><tbody>{conn_rows}</tbody></table>
 
@@ -389,6 +397,33 @@ async def instrument_setup_save(slug: str, request: Request) -> RedirectResponse
     form = await request.form()
     _save_setup(inst, form)
     return RedirectResponse(f"/instrument/{slug}?saved=1", status_code=303)
+
+
+@app.post("/instrument/{slug}/ping")
+async def instrument_ping(slug: str) -> HTMLResponse:
+    instruments = st.load()
+    inst = next((i for i in instruments if i.slug == slug), None)
+    if inst is None:
+        return HTMLResponse('<span style="color:var(--pico-color-red-550)">not found</span>')
+    ok, desc = await asyncio.to_thread(_ping_instrument, inst)
+    if ok:
+        return HTMLResponse(f'<span style="color:var(--pico-color-jade-550)">✓ reachable ({desc})</span>')
+    return HTMLResponse(f'<span style="color:var(--pico-color-red-550)">✗ unreachable ({desc})</span>')
+
+
+def _ping_instrument(inst: st.InstrumentConfig) -> tuple[bool, str]:
+    for val in inst.params.values():
+        if re.match(r'^\d{1,3}(\.\d{1,3}){3}$', val) or (
+            re.match(r'^[a-zA-Z][\w.-]+\.[a-zA-Z]{2,}$', val)
+        ):
+            ok = subprocess.run(
+                ["ping", "-c", "1", "-W", "2", val],
+                capture_output=True,
+            ).returncode == 0
+            return ok, val
+        if val.startswith("/dev/"):
+            return Path(val).exists(), val
+    return False, "no pingable parameter"
 
 
 @app.post("/instrument/{slug}/delete")
