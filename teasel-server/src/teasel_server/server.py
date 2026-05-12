@@ -225,11 +225,6 @@ def _build_config_from_toml(inst_data: dict, cls) -> dict:
         if k in ("package", "driver", "type", "limits", "channels"):
             continue
         config[param_map.get(k, k.upper())] = str(v)
-    for ch_name, ch_cfg in inst_data.get("channels", {}).items():
-        ch_num = ch_name.lstrip("Cc")
-        probe = ch_cfg.get("probe", "none")
-        ratio = probe.rstrip("xX") if probe.lower() != "none" else "none"
-        config[f"LECROY_PROBE_C{ch_num}"] = ratio
     return config
 
 

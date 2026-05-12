@@ -3,10 +3,16 @@ from .instrument import PM5190, PM5190Error
 
 
 class PM5190Driver(FunctionGeneratorBase):
-    slug = "pm5190"
-    name = "Philips PM5190"
     waveforms = ["sine", "square", "triangle", "sine/AM ext", "triangle/AM ext"]
     PARAM_MAP = {"port": "PM5190_PORT", "addr": "PM5190_ADDR", "baud": "PM5190_BAUD"}
+
+    @property
+    def slug(self) -> str:
+        return "pm5190"
+
+    @property
+    def name(self) -> str:
+        return "Philips PM5190"
 
     _waveform_map = {
         "sine": 1,

@@ -1,3 +1,4 @@
+import re
 import tomllib
 from dataclasses import dataclass, field
 from datetime import datetime
@@ -6,6 +7,10 @@ from pathlib import Path
 TEASEL_TOML = "teasel.toml"
 SETUP_TOML = "setup.toml"
 TEASEL_LOG = "teasel.log"
+
+NETLIST_EXTENSIONS = frozenset({".net", ".sp", ".spice", ".asc", ".cir"})
+
+_session_netlist: str | None = None
 
 
 @dataclass
@@ -32,6 +37,75 @@ class InstrumentSetup:
 
 def _toml_path(filename: str, directory: Path | None) -> Path:
     return (directory or Path.cwd()) / filename
+
+
+# ── Netlist (project section of teasel.toml) ──────────────────────────────────
+
+def set_session_netlist(path: str) -> None:
+    global _session_netlist
+    _session_netlist = path
+
+
+def get_netlist_path(directory: Path | None = None) -> str | None:
+    """Return the active netlist path: session override > teasel.toml > None."""
+    if _session_netlist is not None:
+        return _session_netlist
+    return load_netlist_path(directory)
+
+
+def load_netlist_path(directory: Path | None = None) -> str | None:
+    path = _toml_path(TEASEL_TOML, directory)
+    if not path.exists():
+        return None
+    doc = tomllib.loads(path.read_text())
+    return doc.get("project", {}).get("netlist")
+
+
+def save_netlist_path(netlist: str | None, directory: Path | None = None) -> None:
+    directory = directory or Path.cwd()
+    path = _toml_path(TEASEL_TOML, directory)
+    path.write_text(_serialize(load(directory), netlist=netlist))
+
+
+def find_netlists(directory: Path | None = None) -> list[Path]:
+    d = directory or Path.cwd()
+    return sorted(
+        p for p in d.iterdir()
+        if p.is_file() and p.suffix.lower() in NETLIST_EXTENSIONS
+    )
+
+
+# SPICE component first-letter → number of nodes
+_NODE_COUNTS: dict[str, int] = {
+    "R": 2, "C": 2, "L": 2, "V": 2, "I": 2, "D": 2,  # 2-terminal
+    "Q": 3, "J": 3,                                      # BJT / JFET
+    "M": 4, "Z": 4, "E": 4, "G": 4,                     # MOSFET / VCVS / VCCS
+    "F": 2, "H": 2,                                      # CCCS / CCVS (nodes only)
+}
+
+
+def parse_netlist_nodes(path: str | Path) -> list[str]:
+    """Extract unique node names from a SPICE netlist."""
+    nodes: set[str] = set()
+    for line in Path(path).read_text(errors="replace").splitlines():
+        stripped = line.strip()
+        # skip blank, comment, directive, and continuation lines
+        if not stripped or stripped[0] in ("*", ";", ".", "+"):
+            continue
+        tokens = stripped.split()
+        if len(tokens) < 3:
+            continue
+        ref = tokens[0]
+        first = ref[0].upper() if ref else ""
+        if first == "X":
+            # subcircuit: last token is the subcircuit name, everything else is nodes
+            node_toks = tokens[1:-1]
+        else:
+            n = _NODE_COUNTS.get(first, 2)
+            node_toks = tokens[1:1 + n]
+        for tok in node_toks:
+            nodes.add(tok)
+    return sorted(nodes, key=str.casefold)
 
 
 # ── Instrument connections (teasel.toml) ──────────────────────────────────────
@@ -61,13 +135,17 @@ def save(instruments: list[InstrumentConfig], directory: Path | None = None) -> 
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
     old_text = path.read_text() if path.exists() else ""
-    new_text = _serialize(instruments)
+    new_text = _serialize(instruments, netlist=load_netlist_path(directory))
     path.write_text(new_text)
     _append_log(old_text, new_text, directory / TEASEL_LOG, "instruments")
 
 
-def _serialize(instruments: list[InstrumentConfig]) -> str:
+def _serialize(instruments: list[InstrumentConfig], netlist: str | None = None) -> str:
     lines = ["# teasel.toml — lab instruments and connections", ""]
+    if netlist is not None:
+        lines.append("[project]")
+        lines.append(f'netlist = "{_escape(netlist)}"')
+        lines.append("")
     for inst in instruments:
         lines.append(f"[instruments.{inst.slug}]")
         if inst.driver and inst.driver != inst.slug:

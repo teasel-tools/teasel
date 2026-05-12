@@ -22,10 +22,13 @@ app = typer.Typer(
 def _root(
     ctx: typer.Context,
     ver: bool = typer.Option(False, "--version", "-V", is_eager=True, help="Show version and exit."),
+    netlist: Optional[str] = typer.Option(None, "--netlist", help="SPICE netlist path (overrides teasel.toml for this session)."),
 ) -> None:
     if ver:
         typer.echo(get_version())
         raise typer.Exit()
+    if netlist:
+        st.set_session_netlist(netlist)
     if ctx.invoked_subcommand is None:
         from .tui import run_tui
         run_tui()

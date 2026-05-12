@@ -6,6 +6,7 @@ from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, ScrollableContainer
 from textual.screen import ModalScreen, Screen
+from textual.suggester import SuggestFromList
 from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ListItem, ListView
 
 from . import config as cfg
@@ -25,6 +26,7 @@ class ConnectedScreen(Screen):
         Binding("q", "quit", "Quit"),
         Binding("s", "all_setup", "All setup"),
         Binding("c", "connection", "Connection"),
+        Binding("n", "netlist", "Netlist"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -76,6 +78,9 @@ class ConnectedScreen(Screen):
         if not slug or slug == _ADD_ROW_KEY:
             return
         self.app.push_screen(InstrumentDetailScreen(slug, for_connection=True))
+
+    def action_netlist(self) -> None:
+        self.app.push_screen(NetlistScreen())
 
 
 class RegistryBrowserScreen(Screen):
@@ -136,6 +141,17 @@ class RegistryBrowserScreen(Screen):
         self.query_one("#search", Input).focus()
 
 
+def _node_suggester() -> SuggestFromList | None:
+    netlist = st.get_netlist_path()
+    if not netlist:
+        return None
+    try:
+        nodes = st.parse_netlist_nodes(netlist)
+        return SuggestFromList(nodes, case_sensitive=False) if nodes else None
+    except Exception:
+        return None
+
+
 class SetupScreen(Screen):
     BINDINGS = [
         Binding("escape", "app.pop_screen", "Back"),
@@ -147,6 +163,7 @@ class SetupScreen(Screen):
         self.instruments = instruments
 
     def compose(self) -> ComposeResult:
+        suggester = _node_suggester()
         yield Header()
         yield Label("Experiment Setup", id="wizard-title")
         with ScrollableContainer(id="param-fields"):
@@ -155,6 +172,18 @@ class SetupScreen(Screen):
                 current = setups.get(inst.slug, st.InstrumentSetup(slug=inst.slug))
                 yield Label(f"[bold]{inst.slug}[/]  [dim]{inst.type}[/]", classes="setup-section")
                 if inst.type == "function-generator":
+                    for ch, ch_label in (("output", "Main output"), ("ttl", "TTL output")):
+                        ch_cfg = current.channels.get(ch, {})
+                        yield Label(f"{ch_label}  [dim]label[/]")
+                        with Container(classes="probe-row"):
+                            yield _Input(
+                                value=ch_cfg.get("label", ""),
+                                placeholder="e.g. /input",
+                                id=f"ch-{inst.slug}-{ch}-label",
+                                classes="param-input label-input",
+                                suggester=suggester,
+                            )
+                            yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
                     yield Label("Amplitude limit (Vpp)")
                     yield _Input(
                         value=str(current.limits.get("amplitude_max", "")),
@@ -185,13 +214,21 @@ class SetupScreen(Screen):
                                 placeholder="optional label",
                                 id=f"ch-{inst.slug}-{ch}-label",
                                 classes="param-input label-input",
+                                suggester=suggester,
                             )
+                            yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
                 yield Label("", classes="section-spacer")
         yield Button("Save setup.toml", id="btn-save", variant="primary")
         yield Footer()
 
     def action_save(self) -> None:
         self._save()
+
+    @on(Button.Pressed, ".clear-btn")
+    def clear_label(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid.startswith("clear-"):
+            self.query_one(f"#ch-{bid[len('clear-'):]}-label", Input).value = ""
 
     @on(Button.Pressed, "#btn-save")
     def save_pressed(self, _: Button.Pressed) -> None:
@@ -203,6 +240,10 @@ class SetupScreen(Screen):
             limits: dict[str, float] = {}
             channels: dict[str, dict] = {}
             if inst.type == "function-generator":
+                for ch in ("output", "ttl"):
+                    lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
+                    if lbl:
+                        channels[ch] = {"label": lbl}
                 for key in ("amplitude_max", "frequency_max"):
                     widget = self.query_one(f"#limit-{inst.slug}-{key}", Input)
                     val = widget.value.strip()
@@ -214,12 +255,12 @@ class SetupScreen(Screen):
             if inst.type == "oscilloscope":
                 for ch in ("C1", "C2", "C3", "C4"):
                     probe = self.query_one(f"#ch-{inst.slug}-{ch}-probe", Input).value.strip()
-                    label = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
+                    lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
                     ch_data: dict = {}
                     if probe:
                         ch_data["probe"] = probe
-                    if label:
-                        ch_data["label"] = label
+                    if lbl:
+                        ch_data["label"] = lbl
                     if ch_data:
                         channels[ch] = ch_data
             setups.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
@@ -478,6 +519,7 @@ class InstrumentSetupScreen(Screen):
         self.config_path = config_path
 
     def compose(self) -> ComposeResult:
+        suggester = _node_suggester()
         yield Header()
         yield Label(
             f"Setup [bold]{self.instrument.slug}[/]  [dim](optional)[/]",
@@ -490,6 +532,18 @@ class InstrumentSetupScreen(Screen):
         )
         with ScrollableContainer(id="param-fields"):
             if inst.type == "function-generator":
+                for ch, ch_label in (("output", "Main output"), ("ttl", "TTL output")):
+                    ch_cfg = current.channels.get(ch, {})
+                    yield Label(f"{ch_label}  [dim]label[/]")
+                    with Container(classes="probe-row"):
+                        yield _Input(
+                            value=ch_cfg.get("label", ""),
+                            placeholder="e.g. /input",
+                            id=f"ch-{inst.slug}-{ch}-label",
+                            classes="param-input label-input",
+                            suggester=suggester,
+                        )
+                        yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
                 yield Label("Amplitude limit (Vpp)")
                 yield _Input(
                     value=str(current.limits.get("amplitude_max", "")),
@@ -520,7 +574,9 @@ class InstrumentSetupScreen(Screen):
                             placeholder="optional label",
                             id=f"ch-{inst.slug}-{ch}-label",
                             classes="param-input label-input",
+                            suggester=suggester,
                         )
+                        yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
         with Container(id="btn-row"):
             yield Button("Save setup.toml", id="btn-save", variant="primary")
             yield Button("Skip", id="btn-skip", variant="default")
@@ -528,6 +584,12 @@ class InstrumentSetupScreen(Screen):
 
     def action_save_setup(self) -> None:
         self._save()
+
+    @on(Button.Pressed, ".clear-btn")
+    def clear_label(self, event: Button.Pressed) -> None:
+        bid = event.button.id or ""
+        if bid.startswith("clear-"):
+            self.query_one(f"#ch-{bid[len('clear-'):]}-label", Input).value = ""
 
     @on(Button.Pressed, "#btn-save")
     def save_pressed(self, _: Button.Pressed) -> None:
@@ -543,6 +605,10 @@ class InstrumentSetupScreen(Screen):
         channels: dict[str, dict] = {}
 
         if inst.type == "function-generator":
+            for ch in ("output", "ttl"):
+                lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
+                if lbl:
+                    channels[ch] = {"label": lbl}
             for key in ("amplitude_max", "frequency_max"):
                 widget = self.query_one(f"#limit-{inst.slug}-{key}", Input)
                 val = widget.value.strip()
@@ -555,12 +621,12 @@ class InstrumentSetupScreen(Screen):
         if inst.type == "oscilloscope":
             for ch in ("C1", "C2", "C3", "C4"):
                 probe = self.query_one(f"#ch-{inst.slug}-{ch}-probe", Input).value.strip()
-                label = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
+                lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
                 ch_data: dict = {}
                 if probe:
                     ch_data["probe"] = probe
-                if label:
-                    ch_data["label"] = label
+                if lbl:
+                    ch_data["label"] = lbl
                 if ch_data:
                     channels[ch] = ch_data
 
@@ -568,6 +634,58 @@ class InstrumentSetupScreen(Screen):
         existing_setups.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
         st.save_setup(existing_setups)
         self.app.push_screen(SuccessScreen(self.config_path, pops=4))
+
+
+class NetlistScreen(Screen):
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("ctrl+s", "save", "Save"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        current = st.get_netlist_path()
+        self._found = st.find_netlists()
+        yield Header()
+        yield Label("Simulation Netlist", id="wizard-title")
+        with ScrollableContainer(id="param-fields"):
+            if current:
+                yield Label(f"Current: [cyan]{current}[/]", classes="setup-section")
+            else:
+                yield Label("No netlist configured.", classes="setup-section")
+            if self._found:
+                yield Label("[bold]Files found in current directory:[/]")
+                yield ListView(
+                    *[ListItem(Label(p.name), id=f"nl-{i}") for i, p in enumerate(self._found)],
+                    id="netlist-list",
+                )
+                yield Label("")
+            yield Label("[bold]Path[/]  [dim]absolute or relative to current directory[/]")
+            yield _Input(
+                value=current or "",
+                placeholder="e.g. circuit.net",
+                id="netlist-path",
+                classes="param-input",
+            )
+        yield Button("Save to teasel.toml", id="btn-save", variant="primary")
+        yield Footer()
+
+    @on(ListView.Selected, "#netlist-list")
+    def netlist_selected(self, event: ListView.Selected) -> None:
+        idx = int(event.item.id.split("-")[1])
+        self.query_one("#netlist-path", Input).value = str(self._found[idx])
+
+    def action_save(self) -> None:
+        self._save()
+
+    @on(Button.Pressed, "#btn-save")
+    def save_pressed(self, _: Button.Pressed) -> None:
+        self._save()
+
+    def _save(self) -> None:
+        val = self.query_one("#netlist-path", Input).value.strip()
+        st.save_netlist_path(val or None)
+        self.notify("Netlist saved." if val else "Netlist cleared.")
+        self.app.pop_screen()
 
 
 class SuccessScreen(ModalScreen):

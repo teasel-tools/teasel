@@ -88,6 +88,12 @@ DiscoveryPickerScreen {
     width: 1fr;
 }
 
+.clear-btn {
+    width: 3;
+    min-width: 3;
+    margin-left: 1;
+}
+
 SuccessScreen {
     align: center middle;
 }

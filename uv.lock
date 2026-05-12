@@ -995,7 +995,7 @@ wheels = [
 
 [[package]]
 name = "teasel"
-version = "0.2.12"
+version = "0.2.13"
 source = { editable = "teasel-cli" }
 dependencies = [
     { name = "fastapi" },
@@ -1020,7 +1020,7 @@ requires-dist = [
 
 [[package]]
 name = "teasel-server"
-version = "0.1.6"
+version = "0.1.7"
 source = { editable = "teasel-server" }
 dependencies = [
     { name = "mcp", extra = ["cli"] },

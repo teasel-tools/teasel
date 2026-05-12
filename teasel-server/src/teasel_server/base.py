@@ -13,11 +13,29 @@ class WaveformData:
 
 
 class InstrumentBase(ABC):
-    slug: str
-    name: str
+    @property
+    @abstractmethod
+    def slug(self) -> str: ...
+
+    @property
+    @abstractmethod
+    def name(self) -> str: ...
 
     @abstractmethod
     def __init__(self, config: dict): ...
+
+    def connect(self) -> None:
+        """Open the connection to the instrument. Override if the driver needs explicit setup."""
+
+    def disconnect(self) -> None:
+        """Close the connection to the instrument. Override if the driver needs explicit teardown."""
+
+    def __enter__(self):
+        self.connect()
+        return self
+
+    def __exit__(self, *_):
+        self.disconnect()
 
     def status(self) -> str:
         return f"{self.name} connected"

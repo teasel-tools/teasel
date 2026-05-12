@@ -17,10 +17,16 @@ def _parse_probe_env(val: str) -> "dict | None":
 
 
 class LecroyWaveSurferDriver(OscilloscopeBase, FunctionGeneratorBase):
-    slug = "lecroy-wavesurfer"
-    name = "LeCroy WaveSurfer"
     waveforms = ["Sine", "Square", "Triangle", "Pulse", "DC", "Noise", "Arb"]
     PARAM_MAP = {"host": "LECROY_HOST", "resource": "LECROY_RESOURCE"}
+
+    @property
+    def slug(self) -> str:
+        return "lecroy-wavesurfer"
+
+    @property
+    def name(self) -> str:
+        return "LeCroy WaveSurfer"
 
     def __init__(self, config: dict):
         self._scope = LeCroyScope()
@@ -57,11 +63,6 @@ class LecroyWaveSurferDriver(OscilloscopeBase, FunctionGeneratorBase):
                 return f"ERROR: {e}"
             except Exception as e:
                 return f"ERROR: {e}"
-
-    def _probe_warning(self, channel: int) -> str:
-        if self._probes.get(channel) is None and channel in self._probes:
-            return f"WARNING: C{channel} is marked as not connected — data may be noise.\n"
-        return ""
 
     # =========================================================================
     # InstrumentBase

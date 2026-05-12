@@ -38,15 +38,50 @@ def _page(body: str, back: str | None = None) -> HTMLResponse:
     }})();
   </script>
   <style>
-    #theme-toggle {{ background: none; border: none; cursor: pointer; padding: .25rem; color: var(--pico-muted-color); line-height: 1; vertical-align: middle; }}
+    /* Compact Pico overrides */
+    :root {{
+      --pico-font-size: 100%;
+      --pico-spacing: 0.75rem;
+      --pico-form-element-spacing-vertical: 0.35rem;
+      --pico-form-element-spacing-horizontal: 0.6rem;
+      --pico-border-radius: 4px;
+    }}
+    body {{ max-width: 700px; margin: 0 auto; }}
+    h2 {{ font-size: 1.15rem; margin-bottom: 0.375rem; }}
+    h3 {{ font-size: 0.9rem; margin-bottom: 0.375rem; text-transform: uppercase; letter-spacing: .04em; color: var(--pico-muted-color); }}
+    p {{ margin-bottom: 0.5rem; }}
+    hgroup {{ margin-bottom: 1rem; }}
+    hgroup > p {{ margin-top: 0.2rem; font-size: 0.85rem; }}
+    header > nav {{ padding: 0.5rem 0; }}
+    main {{ padding-top: 0.75rem; padding-bottom: 1.5rem; }}
+    footer {{ padding: 0.75rem 0 !important; margin-top: 1.5rem !important; }}
+    label {{ margin-bottom: 0.5rem; font-size: 0.875rem; }}
+    input, select {{ font-size: 0.875rem; margin-bottom: 0; }}
+    table {{ font-size: 0.85rem; }}
+    td, th {{ padding: 0.35rem 0.5rem; }}
+    hr {{ margin: 1.25rem 0; }}
+    details summary {{ font-size: 0.875rem; }}
+    /* Theme toggle */
+    #theme-toggle {{ background: none; border: none; cursor: pointer; padding: .25rem; color: var(--pico-muted-color); line-height: 1; }}
     #theme-toggle:hover {{ color: var(--pico-color); }}
     [data-theme="dark"]  #icon-moon {{ display: none; }}
     [data-theme="light"] #icon-sun  {{ display: none; }}
-    .muted {{ color: var(--pico-muted-color); font-size: .9em; }}
+    /* Utilities */
+    .muted {{ color: var(--pico-muted-color); font-size: .85em; }}
     mark.green {{ background: none; color: var(--pico-color-jade-550); }}
     table tr.link {{ cursor: pointer; }}
-    fieldset {{ border: 1px solid var(--pico-table-border-color); border-radius: var(--pico-border-radius); padding: 1rem; margin-bottom: 1rem; }}
-    fieldset legend {{ padding: 0 .5rem; font-weight: bold; }}
+    /* Compact channel grids */
+    .ch-grid {{ display: grid; grid-template-columns: 2.5rem 7rem 1fr 1.75rem; gap: 0.3rem; align-items: center; margin-bottom: 0.75rem; }}
+    .fg-grid {{ display: grid; grid-template-columns: 4.5rem 1fr 1.75rem; gap: 0.3rem; align-items: center; margin-bottom: 0.75rem; }}
+    .ch-grid input {{ margin-bottom: 0; }}
+    .ch-hdr {{ font-size: 0.7rem; font-weight: 600; color: var(--pico-muted-color); text-transform: uppercase; letter-spacing: .06em; padding-bottom: 0.25rem; border-bottom: 1px solid var(--pico-table-border-color); }}
+    .ch-name {{ font-family: ui-monospace, monospace; font-size: 0.85rem; font-weight: 600; }}
+    .clear-x {{ background: none; border: 1px solid var(--pico-table-border-color); border-radius: 3px; padding: 0.2rem 0.45rem; cursor: pointer; color: var(--pico-muted-color); line-height: 1; font-size: 0.8rem; flex-shrink: 0; }}
+    .ch-grid .clear-x, .fg-grid .clear-x {{ width: 100%; }}
+    .clear-x:hover {{ color: var(--pico-color); border-color: var(--pico-muted-color); }}
+    /* Compact limit row */
+    .limit-row {{ display: grid; grid-template-columns: 1fr 1fr; gap: 0.5rem; margin-bottom: 0.5rem; }}
+    .limit-row label {{ margin-bottom: 0; }}
   </style>
 </head>
 <body hx-boost="true">
@@ -113,6 +148,8 @@ def _registry_rows(entries, installed: set[str], q: str = "") -> str:
 def index(saved: str = "") -> HTMLResponse:
     instruments = st.load()
     setups = {s.slug: s for s in st.load_setup()}
+    netlist_path = st.get_netlist_path()
+    found_netlists = st.find_netlists()
 
     banner = _banner("Configuration saved — Claude will pick it up automatically.") if saved else ""
 
@@ -143,6 +180,35 @@ def index(saved: str = "") -> HTMLResponse:
           <tbody>{rows}</tbody>
         </table>"""
 
+    # Netlist section
+    nl_label = f"<code>{netlist_path}</code>" if netlist_path else "<span class='muted'>not set</span>"
+    nl_datalist = ""
+    nl_list_attr = ""
+    if found_netlists:
+        opts = "".join(f'<option value="{p.name}">' for p in found_netlists)
+        nl_datalist = f'<datalist id="found-netlists">{opts}</datalist>'
+        nl_list_attr = ' list="found-netlists"'
+    clear_btn = (
+        '<button type="submit" name="netlist_path" value="" class="secondary outline">Clear</button>'
+        if netlist_path else ""
+    )
+    netlist_section = f"""
+    <details style="margin-top:2rem">
+      <summary>Simulation netlist &ensp; {nl_label}</summary>
+      <form method="post" action="/project/netlist" style="margin-top:1rem">
+        {nl_datalist}
+        <label>
+          Netlist path
+          <small class="muted">absolute path or filename in current directory</small>
+          <input name="netlist_path" value="{netlist_path or ''}" placeholder="e.g. circuit.net"{nl_list_attr}>
+        </label>
+        <div style="display:flex; gap:1rem; align-items:center">
+          <button type="submit">Save</button>
+          {clear_btn}
+        </div>
+      </form>
+    </details>"""
+
     body = f"""
     {banner}
     <hgroup>
@@ -151,6 +217,7 @@ def index(saved: str = "") -> HTMLResponse:
     </hgroup>
     {content}
     <a href="/registry" role="button" class="outline">⊕ Add device</a>
+    {netlist_section}
     """
     return _page(body)
 
@@ -162,41 +229,44 @@ def instrument_detail(slug: str, saved: str = "") -> HTMLResponse:
     if inst is None:
         return _page(f'<p>Instrument <code>{slug}</code> not found.</p>', back="/")
 
-    setup = next((s for s in st.load_setup() if s.slug == slug), st.InstrumentSetup(slug=slug))
-    banner = _banner("Saved.") if saved else ""
+    current = next((s for s in st.load_setup() if s.slug == slug), st.InstrumentSetup(slug=slug))
+    saved_note = '<span id="saved-note" style="color:var(--pico-color-jade-550);font-size:.875rem;white-space:nowrap">✓ Saved</span>' if saved else ""
+
+    setup_fields = _setup_fields(inst, current)
+    if setup_fields:
+        setup_section = f"""
+        <h3>Experiment setup</h3>
+        <form method="post" action="/instrument/{slug}/setup"
+              oninput="var n=document.getElementById('saved-note');if(n)n.remove()">
+          {setup_fields}
+          <div style="display:flex;align-items:center;gap:1rem">
+            <button type="submit" style="width:auto;margin:0">Save setup</button>
+            {saved_note}
+          </div>
+        </form>"""
+    else:
+        setup_section = '<p class="muted">No setup options for this instrument type.</p>'
 
     conn_rows = "".join(
         f"<tr><td class='muted'>{k}</td><td><code>{v}</code></td></tr>"
         for k, v in inst.params.items()
     ) or "<tr><td colspan='2'><em class='muted'>No connection params</em></td></tr>"
 
-    setup_rows = ""
-    for k, v in setup.limits.items():
-        setup_rows += f"<tr><td class='muted'>{k}</td><td>{v}</td></tr>"
-    for ch, ch_cfg in setup.channels.items():
-        for field, val in ch_cfg.items():
-            setup_rows += f"<tr><td class='muted'>{ch}.{field}</td><td>{val}</td></tr>"
-    if not setup_rows:
-        setup_rows = "<tr><td colspan='2'><em class='muted'>Not configured</em></td></tr>"
-
     body = f"""
-    {banner}
     <hgroup>
       <h2>{slug}</h2>
       <p class="muted">{inst.type or "instrument"} &ensp;·&ensp; {inst.package}</p>
     </hgroup>
 
-    <div style="display:flex; align-items:baseline; gap:1rem; margin-bottom:.5rem">
+    {setup_section}
+
+    <hr style="margin-top:2rem">
+
+    <div style="display:flex; align-items:baseline; gap:1rem; margin-bottom:.5rem; margin-top:1.5rem">
       <h3 style="margin:0">Connection</h3>
       <a href="/instrument/{slug}/connection">Edit</a>
     </div>
     <table><tbody>{conn_rows}</tbody></table>
-
-    <div style="display:flex; align-items:baseline; gap:1rem; margin-bottom:.5rem; margin-top:1.5rem">
-      <h3 style="margin:0">Experiment setup</h3>
-      <a href="/instrument/{slug}/setup">Edit</a>
-    </div>
-    <table><tbody>{setup_rows}</tbody></table>
 
     <button class="secondary outline" style="margin-top:2rem"
             onclick="document.getElementById('confirm-remove').showModal()">
@@ -327,6 +397,16 @@ def instrument_delete(slug: str) -> RedirectResponse:
     st.save(instruments)
     cfg.apply(instruments)
     return RedirectResponse("/", status_code=303)
+
+
+# ── Project settings (/project/*) ────────────────────────────────────────────
+
+@app.post("/project/netlist")
+async def set_netlist(request: Request) -> RedirectResponse:
+    form = await request.form()
+    path = str(form.get("netlist_path", "")).strip()
+    st.save_netlist_path(path or None)
+    return RedirectResponse("/?saved=1", status_code=303)
 
 
 # ── Registry (/registry and /registry/*) ─────────────────────────────────────
@@ -549,39 +629,76 @@ def _collect_params(driver: DriverDescriptor, form) -> dict[str, str]:
     return params
 
 
+def _node_datalist(nodes: list[str]) -> tuple[str, str]:
+    """Return (datalist_html, list_attr) for node suggestions, or ('', '') if no nodes."""
+    if not nodes:
+        return "", ""
+    opts = "".join(f'<option value="{n}">' for n in nodes)
+    # Clear on focus so all options show; restore on blur if nothing new was typed
+    js = ' onfocus="this._v=this.value;this.value=\'\'" onblur="if(!this.value)this.value=this._v"'
+    return f'<datalist id="netlist-nodes">{opts}</datalist>', f' list="netlist-nodes"{js}'
+
+
+def _load_netlist_nodes() -> list[str]:
+    netlist = st.get_netlist_path()
+    if not netlist:
+        return []
+    try:
+        return st.parse_netlist_nodes(netlist)
+    except Exception:
+        return []
+
+
 def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str:
-    html = ""
+    nodes = _load_netlist_nodes()
+    datalist, list_attr = _node_datalist(nodes)
+    html = datalist
     if inst.type == "function-generator":
         amp = current.limits.get("amplitude_max", "")
         freq = current.limits.get("frequency_max", "")
+        fg_rows = ""
+        for ch, ch_label in (("output", "Main"), ("ttl", "TTL")):
+            lbl = current.channels.get(ch, {}).get("label", "")
+            fg_rows += f"""
+          <div class="ch-name">{ch_label}</div>
+          <input name="ch_{ch}_label" value="{lbl}" placeholder="—"{list_attr}>
+          <button type="button" class="clear-x" title="Clear"
+                  onclick="document.querySelector('[name=ch_{ch}_label]').value=''">×</button>"""
         html += f"""
-        <label>
-          Amplitude limit (Vpp)
-          <small class="muted">leave blank for no limit</small>
-          <input name="limit_amplitude_max" type="number" step="any" value="{amp}" placeholder="no limit">
-        </label>
-        <label>
-          Frequency limit (Hz)
-          <small class="muted">leave blank for no limit</small>
-          <input name="limit_frequency_max" type="number" step="any" value="{freq}" placeholder="no limit">
-        </label>"""
+        <div class="fg-grid">
+          <div class="ch-hdr">Output</div>
+          <div class="ch-hdr">Label</div>
+          <div></div>
+          {fg_rows}
+        </div>
+        <div class="limit-row">
+          <label>Amplitude limit (Vpp)
+            <input name="limit_amplitude_max" type="number" step="any" value="{amp}" placeholder="no limit">
+          </label>
+          <label>Frequency limit (Hz)
+            <input name="limit_frequency_max" type="number" step="any" value="{freq}" placeholder="no limit">
+          </label>
+        </div>"""
     if inst.type == "oscilloscope":
+        rows = ""
         for ch in ("C1", "C2", "C3", "C4"):
             ch_cfg = current.channels.get(ch, {})
             probe = ch_cfg.get("probe", "")
             label = ch_cfg.get("label", "")
-            html += f"""
-            <fieldset>
-              <legend>{ch}</legend>
-              <div style="display:grid; grid-template-columns:1fr 2fr; gap:1rem">
-                <label>Probe ratio
-                  <input name="ch_{ch}_probe" value="{probe}" placeholder="e.g. 10x">
-                </label>
-                <label>Label
-                  <input name="ch_{ch}_label" value="{label}" placeholder="optional">
-                </label>
-              </div>
-            </fieldset>"""
+            rows += f"""
+          <div class="ch-name">{ch}</div>
+          <input name="ch_{ch}_probe" value="{probe}" placeholder="e.g. 10x">
+          <input name="ch_{ch}_label" value="{label}" placeholder="—"{list_attr}>
+          <button type="button" class="clear-x" title="Clear"
+                  onclick="document.querySelector('[name=ch_{ch}_label]').value=''">×</button>"""
+        html += f"""
+        <div class="ch-grid">
+          <div class="ch-hdr">Ch</div>
+          <div class="ch-hdr">Probe</div>
+          <div class="ch-hdr">Label</div>
+          <div></div>
+          {rows}
+        </div>"""
     return html
 
 
@@ -595,16 +712,22 @@ def _save_setup(inst: st.InstrumentConfig, form) -> None:
                 limits[key] = float(val)
             except ValueError:
                 pass
-    for ch in ("C1", "C2", "C3", "C4"):
-        probe = str(form.get(f"ch_{ch}_probe", "")).strip()
-        label = str(form.get(f"ch_{ch}_label", "")).strip()
-        ch_data: dict = {}
-        if probe:
-            ch_data["probe"] = probe
-        if label:
-            ch_data["label"] = label
-        if ch_data:
-            channels[ch] = ch_data
+    if inst.type == "function-generator":
+        for ch in ("output", "ttl"):
+            lbl = str(form.get(f"ch_{ch}_label", "")).strip()
+            if lbl:
+                channels[ch] = {"label": lbl}
+    else:
+        for ch in ("C1", "C2", "C3", "C4"):
+            probe = str(form.get(f"ch_{ch}_probe", "")).strip()
+            ch_label = str(form.get(f"ch_{ch}_label", "")).strip()
+            ch_data: dict = {}
+            if probe:
+                ch_data["probe"] = probe
+            if ch_label:
+                ch_data["label"] = ch_label
+            if ch_data:
+                channels[ch] = ch_data
     existing = [s for s in st.load_setup() if s.slug != inst.slug]
     existing.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
     st.save_setup(existing)
