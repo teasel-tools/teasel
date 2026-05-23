@@ -8,4 +8,5 @@ build/
 setup.toml
 teasel.log
 teasel.toml
+teasel-output/
 

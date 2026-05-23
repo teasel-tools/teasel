@@ -31,6 +31,53 @@ Community instruments are listed in the [instruments registry](https://github.co
 
 Any Python package can add instruments to `teasel-server` by registering a `teasel.instruments` entry point. No changes to this repo required.
 
+## Running with a local LLM
+
+`local_teasel.py` is a standalone bridge script that connects teasel-server to a local LLM via [llama-server](https://github.com/ggerganov/llama.cpp) — no Claude or Anthropic API needed.
+
+### 1. Get llama-server and a model
+
+```bash
+pip install llama-cpp-python[server] huggingface-hub
+huggingface-cli download bartowski/Ministral-3B-Instruct-2410-GGUF \
+  --include "Ministral-3B-Instruct-2410-Q8_0.gguf" --local-dir ~/models
+```
+
+### 2. Start llama-server
+
+**Local (CPU-only):**
+```bash
+llama-server -m ~/models/Ministral-3B-Instruct-2410-Q8_0.gguf --jinja -ngl 0 --port 8080
+```
+
+**Rented GPU (RunPod / vast.ai — recommended for demos):**
+
+On the pod, run the same install + download commands above, then:
+```bash
+llama-server -m ~/models/Ministral-3B-Instruct-2410-Q8_0.gguf --jinja -ngl 999 --port 8080 --host 0.0.0.0
+```
+Expose TCP port 8080 in the pod settings to get a public IP and port.
+
+### 3. Start teasel-server in HTTP mode
+
+```bash
+uv run teasel-server --config teasel.toml --setup setup.toml --transport streamable-http --port 7891
+```
+
+### 4. Run the bridge
+
+```bash
+# Local llama-server:
+python local_teasel.py
+
+# Rented GPU:
+python local_teasel.py --llama-url http://<pod-ip>:<port>
+```
+
+The bridge uses `httpx` (already a teasel dependency) — no extra packages required.
+
+---
+
 ## Development
 
 This repo is a [uv workspace](https://docs.astral.sh/uv/concepts/workspaces/). Both packages share a single venv.

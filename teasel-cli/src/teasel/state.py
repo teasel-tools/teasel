@@ -7,6 +7,7 @@ from pathlib import Path
 TEASEL_TOML = "teasel.toml"
 SETUP_TOML = "setup.toml"
 TEASEL_LOG = "teasel.log"
+LLM_CONFIG_PATH = Path.home() / ".teasel" / "llm.toml"
 
 NETLIST_EXTENSIONS = frozenset({".net", ".sp", ".spice", ".asc", ".cir"})
 
@@ -200,6 +201,28 @@ def _serialize_setup(setups: list[InstrumentSetup]) -> str:
                 lines.append(_toml_value(k, str(v)))
             lines.append("")
     return "\n".join(lines)
+
+
+# ── LLM config (~/.teasel/llm.toml) ──────────────────────────────────────────
+
+def load_llm_config() -> dict:
+    """Return saved LLM config dict (keys: provider, model, cf_account, cf_token, ollama_url)."""
+    if not LLM_CONFIG_PATH.exists():
+        return {}
+    try:
+        return tomllib.loads(LLM_CONFIG_PATH.read_text()).get("llm", {})
+    except Exception:
+        return {}
+
+
+def save_llm_config(cfg: dict) -> None:
+    """Write LLM config to ~/.teasel/llm.toml."""
+    LLM_CONFIG_PATH.parent.mkdir(exist_ok=True)
+    lines = ["[llm]"]
+    for k, v in cfg.items():
+        if v:
+            lines.append(f'{k} = "{_escape(str(v))}"')
+    LLM_CONFIG_PATH.write_text("\n".join(lines) + "\n")
 
 
 # ── Instance naming ───────────────────────────────────────────────────────────

@@ -219,7 +219,10 @@ def index(saved: str = "") -> HTMLResponse:
       <p>Instruments in <code>teasel.toml</code>, available to Claude via MCP.</p>
     </hgroup>
     {content}
-    <a href="/registry" role="button" class="outline">⊕ Add device</a>
+    <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+      <a href="/registry" role="button" class="outline">⊕ Add device</a>
+      <a href="/settings/llm" style="font-size:.875rem;color:var(--pico-muted-color)">⚙ LLM settings</a>
+    </div>
     {netlist_section}
     """
     return _page(body)
@@ -766,3 +769,106 @@ def _save_setup(inst: st.InstrumentConfig, form) -> None:
     existing = [s for s in st.load_setup() if s.slug != inst.slug]
     existing.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
     st.save_setup(existing)
+
+
+# ── LLM settings (/settings/llm) ─────────────────────────────────────────────
+
+@app.get("/settings/llm", response_class=HTMLResponse)
+def llm_settings(saved: str = "") -> HTMLResponse:
+    cfg = st.load_llm_config()
+    provider = cfg.get("provider", "ollama")
+    model = cfg.get("model", "")
+    ollama_url = cfg.get("ollama_url", "http://localhost:11434")
+    cf_account = cfg.get("cf_account", "")
+    cf_token_raw = cfg.get("cf_token", "")
+    cf_token_display = (cf_token_raw[:8] + "••••••••") if cf_token_raw else ""
+
+    banner = _banner("LLM settings saved.") if saved else ""
+
+    ollama_hidden = "" if provider == "ollama" else ' style="display:none"'
+    cf_hidden = "" if provider == "cloudflare" else ' style="display:none"'
+
+    body = f"""
+    {banner}
+    <hgroup>
+      <h2>LLM Settings</h2>
+      <p>Configure the inference backend for <code>teasel local</code> and optional server-side data preprocessing.</p>
+    </hgroup>
+    <form method="post" action="/settings/llm">
+      <fieldset>
+        <legend>Provider</legend>
+        <label>
+          <input type="radio" name="provider" value="ollama"
+            {"checked" if provider == "ollama" else ""}
+            onchange="document.getElementById('ollama-fields').style.display='';document.getElementById('cf-fields').style.display='none'">
+          Ollama / llama-server (local)
+        </label>
+        <label>
+          <input type="radio" name="provider" value="cloudflare"
+            {"checked" if provider == "cloudflare" else ""}
+            onchange="document.getElementById('cf-fields').style.display='';document.getElementById('ollama-fields').style.display='none'">
+          Cloudflare Workers AI
+        </label>
+      </fieldset>
+
+      <div id="ollama-fields"{ollama_hidden}>
+        <label>
+          Ollama URL
+          <input name="ollama_url" value="{ollama_url}" placeholder="http://localhost:11434">
+        </label>
+        <label>
+          Model
+          <input name="ollama_model" value="{model if provider == "ollama" else ""}" placeholder="qwen2.5:3b">
+        </label>
+      </div>
+
+      <div id="cf-fields"{cf_hidden}>
+        <label>
+          Account ID
+          <input name="cf_account" value="{cf_account}" placeholder="Cloudflare account ID">
+        </label>
+        <label>
+          API Token
+          <input name="cf_token" value="" placeholder="{cf_token_display or "Cloudflare API token"}">
+          <small class="muted">Leave blank to keep existing token.</small>
+        </label>
+        <label>
+          Model
+          <input name="cf_model" value="{model if provider == "cloudflare" else ""}"
+            placeholder="@cf/mistralai/mistral-small-3.1-24b-instruct">
+        </label>
+      </div>
+
+      <button type="submit">Save</button>
+    </form>
+    <p class="muted" style="margin-top:1rem;font-size:.8rem">
+      Credentials are stored in <code>~/.teasel/llm.toml</code> (outside the project directory).
+    </p>
+    """
+    return _page(body, back="/")
+
+
+@app.post("/settings/llm")
+async def llm_settings_save(request: Request) -> RedirectResponse:
+    form = await request.form()
+    provider = str(form.get("provider", "ollama"))
+    cfg: dict = {"provider": provider}
+
+    if provider == "cloudflare":
+        cfg["cf_account"] = str(form.get("cf_account", "")).strip()
+        new_token = str(form.get("cf_token", "")).strip()
+        if new_token:
+            cfg["cf_token"] = new_token
+        else:
+            cfg["cf_token"] = st.load_llm_config().get("cf_token", "")
+        model = str(form.get("cf_model", "")).strip()
+        if model:
+            cfg["model"] = model
+    else:
+        cfg["ollama_url"] = str(form.get("ollama_url", "http://localhost:11434")).strip()
+        model = str(form.get("ollama_model", "")).strip()
+        if model:
+            cfg["model"] = model
+
+    st.save_llm_config(cfg)
+    return RedirectResponse("/settings/llm?saved=1", status_code=303)

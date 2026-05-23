@@ -1,6 +1,7 @@
 """Unified MCP server — discovers instrument drivers via entry points and registers tools."""
 
 import functools
+import logging
 import os
 import tomllib
 from dataclasses import dataclass, field
@@ -10,10 +11,22 @@ from typing import Callable
 
 from mcp.server.fastmcp import FastMCP
 
+logging.getLogger("pyvisa").setLevel(logging.CRITICAL)
+
+_log = logging.getLogger("teasel")
+_log_file = Path.home() / ".teasel" / "server.log"
+_log_file.parent.mkdir(exist_ok=True)
+logging.basicConfig(
+    filename=_log_file,
+    level=logging.DEBUG,
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+
 from .base import FunctionGeneratorBase, InstrumentBase, OscilloscopeBase
+from .llm import LLMClient
 from .output import write_screenshot, write_waveform
 
-mcp = FastMCP("teasel")
+mcp = FastMCP("teasel")  # reconfigured in main() before use
 
 
 # ── Server state ──────────────────────────────────────────────────────────────
@@ -26,6 +39,7 @@ class _ServerState:
     setup_changed: bool = False
     setup_diff: str = ""
     drivers: list[InstrumentBase] = field(default_factory=list)
+    llm: LLMClient | None = None
 
 
 _state = _ServerState()
@@ -143,6 +157,11 @@ def _register_function_generator(driver: FunctionGeneratorBase) -> None:
 
     def make_configure(d):
         def configure(freq_hz: float, vpp: float, dc: float = 0.0, waveform: str = "sine") -> str:
+            limits = getattr(d, "_limits", {})
+            if "frequency_max" in limits and freq_hz > limits["frequency_max"]:
+                return f"Limit exceeded: requested {freq_hz} Hz but safety limit is {limits['frequency_max']} Hz"
+            if "amplitude_max" in limits and vpp > limits["amplitude_max"]:
+                return f"Limit exceeded: requested {vpp} Vpp but safety limit is {limits['amplitude_max']} Vpp"
             try:
                 d.configure(freq_hz, vpp, dc, waveform)
                 return f"Configured: {freq_hz} Hz, {vpp} Vpp, {dc} V DC, {waveform}"
@@ -165,10 +184,28 @@ def _register_oscilloscope(driver: OscilloscopeBase) -> None:
             try:
                 data = d.capture_waveform(channel)
                 path = write_waveform(data)
-                return f"Waveform saved to {path}"
+                n = len(data.voltage_data)
+                v_min = min(data.voltage_data)
+                v_max = max(data.voltage_data)
+                v_mean = sum(data.voltage_data) / n
+                vpp = v_max - v_min
+                if _state.llm:
+                    try:
+                        summary = _state.llm.summarize_waveform({
+                            "channel": channel, "points": n,
+                            "sample_rate_hz": data.sample_rate,
+                            "v_min": v_min, "v_max": v_max, "v_mean": v_mean,
+                        })
+                        return f"{summary}\nData saved to {path}"
+                    except Exception as e:
+                        _log.warning(f"LLM waveform summary failed: {e}")
+                return (
+                    f"Ch{channel}: {vpp:.3f}Vpp, mean {v_mean:.3f}V, "
+                    f"{n} pts @ {data.sample_rate/1e3:.0f}kHz SR. Saved to {path}"
+                )
             except Exception as e:
                 return f"Error: {e}"
-        capture_waveform.__doc__ = f"Capture waveform from a channel on {d.name}. Data is saved to a CSV file; returns the path."
+        capture_waveform.__doc__ = f"Capture waveform from a channel on {d.name}. Data is saved to a CSV file; returns stats and path."
         return capture_waveform
 
     def make_set_timebase(d):
@@ -196,12 +233,18 @@ def _register_oscilloscope(driver: OscilloscopeBase) -> None:
             try:
                 data = d.screenshot()
                 path = write_screenshot(d.slug, data)
+                if _state.llm:
+                    try:
+                        description = _state.llm.describe_screenshot(data)
+                        return f"{description}\nScreenshot saved to {path}"
+                    except Exception as e:
+                        _log.warning(f"LLM screenshot description failed: {e}")
                 return f"Screenshot saved to {path}"
             except NotImplementedError:
                 return f"{d.name} does not support screenshots"
             except Exception as e:
                 return f"Error: {e}"
-        screenshot.__doc__ = f"Capture a screenshot from {d.name}. Image is saved to a PNG file; returns the path."
+        screenshot.__doc__ = f"Capture a screenshot from {d.name}. Image is saved to a PNG file; returns path and optional description."
         return screenshot
 
     mcp.add_tool(with_setup_check(make_capture_waveform(driver)), name=f"{slug}_capture_waveform")
@@ -257,7 +300,8 @@ def _load_drivers(
                 drivers.append(driver)
                 print(f"Loaded driver: {driver.name} as '{inst_name}'")
             except Exception as e:
-                print(f"Failed to load driver '{inst_name}': {e}")
+                print(f"Failed to load driver '{inst_name}': {e} (see {_log_file})")
+                _log.exception(f"Failed to load driver '{inst_name}'")
     else:
         for ep in eps.values():
             cls = ep.load()
@@ -268,7 +312,8 @@ def _load_drivers(
                 drivers.append(driver)
                 print(f"Loaded driver: {driver.name} ({driver.slug})")
             except Exception as e:
-                print(f"Failed to load driver {ep.name}: {e}")
+                print(f"Failed to load driver {ep.name}: {e} (see {_log_file})")
+                _log.exception(f"Failed to load driver '{ep.name}'")
 
     return drivers
 
@@ -319,6 +364,16 @@ def main():
     parser = argparse.ArgumentParser(add_help=False)
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--setup", type=Path, default=None)
+    parser.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http"])
+    parser.add_argument("--host", default="0.0.0.0")
+    parser.add_argument("--port", type=int, default=7891)
+    parser.add_argument("--llm-url", default=None,
+                        help="Ollama/llama-server base URL for data preprocessing (e.g. http://localhost:11434)")
+    parser.add_argument("--llm-model", default=None, help="Model name for --llm-url")
+    parser.add_argument("--cf-account", default=os.environ.get("CF_ACCOUNT_ID"),
+                        help="Cloudflare account ID for LLM preprocessing (or CF_ACCOUNT_ID env)")
+    parser.add_argument("--cf-token", default=os.environ.get("CF_API_TOKEN"),
+                        help="Cloudflare API token (or CF_API_TOKEN env)")
     args, _ = parser.parse_known_args()
 
     teasel_config = None
@@ -345,5 +400,18 @@ def main():
         except OSError:
             pass
 
+    if args.cf_account and args.cf_token:
+        cf_model = args.llm_model or "@cf/mistralai/mistral-small-3.1-24b-instruct"
+        base_url = f"https://api.cloudflare.com/client/v4/accounts/{args.cf_account}/ai/v1"
+        _state.llm = LLMClient(base_url, cf_model, {"Authorization": f"Bearer {args.cf_token}"})
+        print(f"LLM preprocessing: Cloudflare Workers AI — {cf_model}")
+    elif args.llm_url and args.llm_model:
+        _state.llm = LLMClient(f"{args.llm_url}/v1", args.llm_model)
+        print(f"LLM preprocessing: {args.llm_url} — {args.llm_model}")
+
+    mcp.settings.host = args.host
+    mcp.settings.port = args.port
     mcp.add_tool(_get_setup, name="get_setup")
-    mcp.run(transport="stdio")
+    if args.transport == "streamable-http":
+        print(f"Listening on {args.host}:{args.port}")
+    mcp.run(transport=args.transport)
