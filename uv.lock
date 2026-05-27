@@ -206,7 +206,7 @@ wheels = [
 
 [[package]]
 name = "forge-guardrails"
-version = "0.7.0"
+version = "0.7.2"
 source = { editable = "../forge" }
 dependencies = [
     { name = "httpx" },

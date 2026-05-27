@@ -114,7 +114,9 @@ async def run(base_url: str, teasel_url: str, model: str, headers: dict) -> None
                 tools=tools,
                 required_steps=[],
                 terminal_tool=RESPOND_TOOL_NAME,
-                system_prompt_template=SYSTEM_PROMPT,
+                # System prompt is seeded directly into `initial_messages` below,
+                # so forge's template path is never invoked.
+                system_prompt_template="",
             )
 
             print(f"Connected — {len(mcp_tools)} tools available.")

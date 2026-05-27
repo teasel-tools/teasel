@@ -33,7 +33,7 @@ Any Python package can add instruments to `teasel-server` by registering a `teas
 
 ## Running with a local LLM
 
-`local_teasel.py` is a standalone bridge script that connects teasel-server to a local LLM via [llama-server](https://github.com/ggerganov/llama.cpp) — no Claude or Anthropic API needed.
+`teasel local` connects teasel-server to a local LLM via [llama-server](https://github.com/ggerganov/llama.cpp) — no Claude or Anthropic API needed.
 
 ### 1. Get llama-server and a model
 
@@ -68,13 +68,11 @@ uv run teasel-server --config teasel.toml --setup setup.toml --transport streama
 
 ```bash
 # Local llama-server:
-python local_teasel.py
+uv run teasel local
 
 # Rented GPU:
-python local_teasel.py --llama-url http://<pod-ip>:<port>
+uv run teasel local --llama-url http://<pod-ip>:<port>
 ```
-
-The bridge uses `httpx` (already a teasel dependency) — no extra packages required.
 
 ---
 
