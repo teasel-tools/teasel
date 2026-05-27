@@ -9,6 +9,7 @@ DEFAULT_OLLAMA_URL = "http://localhost:11434"
 DEFAULT_TEASEL_URL = "http://localhost:7891/mcp"
 DEFAULT_OLLAMA_MODEL = "mistral:7b"
 CF_DEFAULT_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
+CF_BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
 
 SYSTEM_PROMPT = (
     "You are a lab instrument assistant. You have access to tools that control real "
@@ -26,7 +27,7 @@ def build_base_url_and_headers(
 ) -> tuple[str, dict, str]:
     """Return (base_url, headers, model). CLI flags > saved config > defaults."""
     if cf_account and cf_token:
-        base_url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account}/ai/v1"
+        base_url = CF_BASE_URL.format(account_id=cf_account)
         model = model_override or CF_DEFAULT_MODEL
         print(f"Using Cloudflare Workers AI — {model}")
         return base_url, {"Authorization": f"Bearer {cf_token}"}, model
@@ -35,7 +36,7 @@ def build_base_url_and_headers(
         account = saved_cfg.get("cf_account", "")
         token = saved_cfg.get("cf_token", "")
         if account and token:
-            base_url = f"https://api.cloudflare.com/client/v4/accounts/{account}/ai/v1"
+            base_url = CF_BASE_URL.format(account_id=account)
             model = model_override or saved_cfg.get("model", CF_DEFAULT_MODEL)
             print(f"Using Cloudflare Workers AI — {model}")
             return base_url, {"Authorization": f"Bearer {token}"}, model

@@ -26,6 +26,9 @@ from .base import FunctionGeneratorBase, InstrumentBase, OscilloscopeBase
 from .llm import LLMClient
 from .output import write_screenshot, write_waveform
 
+CF_DEFAULT_MODEL = "@cf/mistralai/mistral-small-3.1-24b-instruct"
+CF_BASE_URL = "https://api.cloudflare.com/client/v4/accounts/{account_id}/ai/v1"
+
 mcp = FastMCP("teasel")  # reconfigured in main() before use
 
 
@@ -401,8 +404,8 @@ def main():
             pass
 
     if args.cf_account and args.cf_token:
-        cf_model = args.llm_model or "@cf/mistralai/mistral-small-3.1-24b-instruct"
-        base_url = f"https://api.cloudflare.com/client/v4/accounts/{args.cf_account}/ai/v1"
+        cf_model = args.llm_model or CF_DEFAULT_MODEL
+        base_url = CF_BASE_URL.format(account_id=args.cf_account)
         _state.llm = LLMClient(base_url, cf_model, {"Authorization": f"Bearer {args.cf_token}"})
         print(f"LLM preprocessing: Cloudflare Workers AI — {cf_model}")
     elif args.llm_url and args.llm_model:

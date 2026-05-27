@@ -11,6 +11,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from . import config as cfg
 from . import get_version
 from . import state as st
+from .local_llm import CF_DEFAULT_MODEL
 from .registry import DriverDescriptor, fetch_driver, fetch_index
 
 app = FastAPI(title="teasel", version=get_version())
@@ -835,7 +836,7 @@ def llm_settings(saved: str = "") -> HTMLResponse:
         <label>
           Model
           <input name="cf_model" value="{model if provider == "cloudflare" else ""}"
-            placeholder="@cf/mistralai/mistral-small-3.1-24b-instruct">
+            placeholder="{CF_DEFAULT_MODEL}">
         </label>
       </div>
 
