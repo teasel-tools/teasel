@@ -120,6 +120,10 @@ def with_setup_check(fn: Callable) -> Callable:
 def _register_function_generator(driver: FunctionGeneratorBase) -> None:
     slug = getattr(driver, "instance_name", driver.slug)
 
+    # _limits is an optional driver convention, not part of FunctionGeneratorBase:
+    # a dict like {"frequency_max": 1e6, "amplitude_max": 10.0} sourced from
+    # teasel.toml when the user configured safety caps. Drivers without one
+    # behave as unlimited; the getattr default keeps that path branch-free.
     def make_set_frequency(d):
         def set_frequency(freq_hz: float) -> str:
             limits = getattr(d, "_limits", {})
@@ -364,7 +368,10 @@ def _get_setup() -> str:
 
 def main():
     import argparse
+    import sys
+    from . import get_version
     parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--version", action="store_true", help="Print version and exit.")
     parser.add_argument("--config", type=Path, default=None)
     parser.add_argument("--setup", type=Path, default=None)
     parser.add_argument("--transport", default="stdio", choices=["stdio", "streamable-http"])
@@ -378,6 +385,13 @@ def main():
     parser.add_argument("--cf-token", default=os.environ.get("CF_API_TOKEN"),
                         help="Cloudflare API token (or CF_API_TOKEN env)")
     args, _ = parser.parse_known_args()
+
+    if args.version:
+        print(get_version())
+        return
+
+    # Banner to stderr — stdout is the JSON-RPC channel in stdio transport.
+    print(f"teasel-server {get_version()}", file=sys.stderr)
 
     teasel_config = None
     if args.config and args.config.exists():

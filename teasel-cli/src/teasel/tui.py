@@ -7,7 +7,7 @@ from textual.binding import Binding
 from textual.containers import Container, ScrollableContainer
 from textual.screen import ModalScreen, Screen
 from textual.suggester import SuggestFromList
-from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ListItem, ListView
+from textual.widgets import Button, DataTable, Footer, Header, Input, Label, ListItem, ListView, Select
 
 from . import config as cfg
 from . import state as st
@@ -27,6 +27,7 @@ class ConnectedScreen(Screen):
         Binding("s", "all_setup", "All setup"),
         Binding("c", "connection", "Connection"),
         Binding("n", "netlist", "Netlist"),
+        Binding("l", "llm", "LLM backends"),
     ]
 
     def compose(self) -> ComposeResult:
@@ -81,6 +82,9 @@ class ConnectedScreen(Screen):
 
     def action_netlist(self) -> None:
         self.app.push_screen(NetlistScreen())
+
+    def action_llm(self) -> None:
+        self.app.push_screen(LLMProvidersScreen())
 
 
 class RegistryBrowserScreen(Screen):
@@ -711,6 +715,186 @@ class SuccessScreen(ModalScreen):
         self.dismiss()
         for _ in range(self.pops):
             self.app.pop_screen()
+
+
+_PROVIDER_TYPES = [
+    ("Cloudflare Workers AI", "cloudflare"),
+    ("Ollama / llama-server", "ollama"),
+    ("OpenAI-compatible", "openai-compat"),
+]
+
+
+class LLMProvidersScreen(Screen):
+    """List, add, edit, delete LLM backends and set the default."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("a", "add", "Add"),
+        Binding("e", "edit", "Edit"),
+        Binding("d", "delete", "Delete"),
+        Binding("space", "set_default", "Set default"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label("LLM backends", id="wizard-title")
+        yield DataTable(id="providers-table", cursor_type="row")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._focused: str | None = None
+        table = self.query_one(DataTable)
+        table.add_columns("", "Name", "Type", "Model")
+        self._refresh()
+
+    def on_screen_resume(self) -> None:
+        self._refresh()
+
+    def _refresh(self) -> None:
+        table = self.query_one(DataTable)
+        table.clear()
+        default = st.get_default_provider()
+        for pc in st.load_providers().values():
+            mark = "[green]★[/]" if pc.name == default else ""
+            table.add_row(mark, pc.name, pc.type, pc.model or "—", key=pc.name)
+        table.add_row("[dim]⊕ Add backend[/]", "", "", "", key=_ADD_ROW_KEY)
+
+    @on(DataTable.RowHighlighted, "#providers-table")
+    def row_highlighted(self, event: DataTable.RowHighlighted) -> None:
+        self._focused = str(event.row_key.value) if event.row_key else None
+
+    @on(DataTable.RowSelected, "#providers-table")
+    def row_selected(self, event: DataTable.RowSelected) -> None:
+        key = str(event.row_key.value)
+        if key == _ADD_ROW_KEY:
+            self.app.push_screen(ProviderWizardScreen())
+        else:
+            self.app.push_screen(ProviderWizardScreen(key))
+
+    def action_add(self) -> None:
+        self.app.push_screen(ProviderWizardScreen())
+
+    def action_edit(self) -> None:
+        if self._focused and self._focused != _ADD_ROW_KEY:
+            self.app.push_screen(ProviderWizardScreen(self._focused))
+
+    def action_delete(self) -> None:
+        if self._focused and self._focused != _ADD_ROW_KEY:
+            st.delete_provider(self._focused)
+            self.notify(f"Deleted backend '{self._focused}'.")
+            self._refresh()
+
+    def action_set_default(self) -> None:
+        if self._focused and self._focused != _ADD_ROW_KEY:
+            st.set_default_provider(self._focused)
+            self.notify(f"'{self._focused}' is now the default.")
+            self._refresh()
+
+
+class ProviderWizardScreen(Screen):
+    """Add or edit a single LLM backend bundle."""
+
+    BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
+        Binding("ctrl+s", "save", "Save"),
+    ]
+
+    def __init__(self, name: str | None = None) -> None:
+        super().__init__()
+        self.name = name
+        self.existing = st.load_providers().get(name) if name else None
+
+    def compose(self) -> ComposeResult:
+        pc = self.existing
+        yield Header()
+        yield Label("Edit backend" if pc else "Add backend", id="wizard-title")
+        with ScrollableContainer(id="param-fields"):
+            yield Label("[bold]Name[/]  [dim]lowercase, hyphens[/]")
+            if pc:
+                yield Label(f"[cyan]{pc.name}[/]")
+            else:
+                yield _Input(placeholder="e.g. cf-mistral", id="p-name", classes="param-input")
+
+            yield Label("[bold]Backend type[/]")
+            yield Select(
+                _PROVIDER_TYPES,
+                value=pc.type if pc else "cloudflare",
+                allow_blank=False,
+                id="p-type",
+            )
+
+            with Container(id="cf-fields"):
+                yield Label("[bold]Cloudflare account ID[/]")
+                yield _Input(value=pc.account if pc else "", id="p-account", classes="param-input")
+                yield Label("[bold]API token[/]  [dim]leave blank to keep existing[/]")
+                yield _Input(
+                    password=True, placeholder="•••• (kept if blank)" if pc and pc.token else "",
+                    id="p-token", classes="param-input",
+                )
+
+            with Container(id="ollama-fields"):
+                yield Label("[bold]Ollama URL[/]")
+                yield _Input(
+                    value=pc.url if pc else "http://localhost:11434",
+                    id="p-url", classes="param-input",
+                )
+
+            with Container(id="oc-fields"):
+                yield Label("[bold]Base URL[/]  [dim]…/v1[/]")
+                yield _Input(value=pc.base_url if pc else "", id="p-base-url", classes="param-input")
+                yield Label("[bold]API key[/]  [dim]leave blank to keep / if none[/]")
+                yield _Input(
+                    password=True, placeholder="•••• (kept if blank)" if pc and pc.api_key else "",
+                    id="p-api-key", classes="param-input",
+                )
+
+            yield Label("[bold]Model[/]")
+            yield _Input(value=pc.model if pc else "", id="p-model", classes="param-input")
+        yield Button("Save", id="btn-save", variant="primary")
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._apply_visibility(self.query_one("#p-type", Select).value)
+
+    @on(Select.Changed, "#p-type")
+    def type_changed(self, event: Select.Changed) -> None:
+        self._apply_visibility(event.value)
+
+    def _apply_visibility(self, ptype: str) -> None:
+        self.query_one("#cf-fields").display = ptype == "cloudflare"
+        self.query_one("#ollama-fields").display = ptype == "ollama"
+        self.query_one("#oc-fields").display = ptype == "openai-compat"
+
+    def action_save(self) -> None:
+        self._save()
+
+    @on(Button.Pressed, "#btn-save")
+    def save_pressed(self, _: Button.Pressed) -> None:
+        self._save()
+
+    def _save(self) -> None:
+        name = self.name or self.query_one("#p-name", Input).value.strip()
+        if not name:
+            self.notify("Name is required.", severity="error")
+            return
+        ptype = self.query_one("#p-type", Select).value
+        model = self.query_one("#p-model", Input).value.strip()
+        pc = st.ProviderConfig(name=name, type=ptype, model=model)
+
+        if ptype == "cloudflare":
+            pc.account = self.query_one("#p-account", Input).value.strip()
+            token = self.query_one("#p-token", Input).value.strip()
+            pc.token = token or (self.existing.token if self.existing else "")
+        elif ptype == "openai-compat":
+            pc.base_url = self.query_one("#p-base-url", Input).value.strip()
+            key = self.query_one("#p-api-key", Input).value.strip()
+            pc.api_key = key or (self.existing.api_key if self.existing else "")
+        else:  # ollama
+            pc.url = self.query_one("#p-url", Input).value.strip()
+
+        st.save_provider(pc)
+        self.notify(f"Saved backend '{name}'.")
+        self.app.pop_screen()
 
 
 class TeaselApp(App):

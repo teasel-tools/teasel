@@ -3,6 +3,3 @@ members = [
     "teasel-cli",
     "teasel-server",
 ]
-
-[tool.uv.sources]
-forge-guardrails = { path = "../forge", editable = true }

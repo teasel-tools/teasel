@@ -132,26 +132,51 @@ def web(
 ) -> None:
     """Start the teasel web UI."""
     import uvicorn
+    console.print(f"[dim]teasel {get_version()}[/dim]")
     console.print(f"Starting teasel web UI at [link]http://{host}:{port}[/link]")
     uvicorn.run("teasel.web:app", host=host, port=port, reload=False)
 
 
 @app.command()
 def local(
-    model: Optional[str] = typer.Option(None, "--model", help="Override model name"),
-    llama_url: str = typer.Option("http://localhost:11434", "--llama-url", help="Ollama base URL"),
+    provider: Optional[str] = typer.Option(None, "--provider", help="Named backend from ~/.teasel/llm.toml (overrides teasel.toml and the default)"),
+    model: Optional[str] = typer.Option(None, "--model", help="Session-only model override (not persisted)"),
     teasel_url: str = typer.Option("http://localhost:7891/mcp", "--teasel-url", help="teasel-server MCP URL"),
-    cf_account: Optional[str] = typer.Option(None, "--cf-account", envvar="CF_ACCOUNT_ID", help="Cloudflare account ID"),
-    cf_token: Optional[str] = typer.Option(None, "--cf-token", envvar="CF_API_TOKEN", help="Cloudflare API token"),
 ) -> None:
     """Run the local LLM REPL — replaces Claude Code for fully local or offline operation."""
     import asyncio
-    from .local_llm import build_base_url_and_headers, run
-    saved_cfg = st.load_llm_config()
-    base_url, headers, resolved_model = build_base_url_and_headers(
-        saved_cfg, cf_account, cf_token, llama_url, model
-    )
-    asyncio.run(run(base_url, teasel_url, resolved_model, headers))
+    import socket
+    from urllib.parse import urlparse
+    from .local_llm import run, run_first_run_wizard
+
+    console.print(f"[dim]teasel {get_version()}[/dim]")
+
+    # Pre-flight: the REPL opens an MCP stream to teasel-server. If it isn't
+    # running, the failure surfaces deep in the anyio/httpx stack as a
+    # multi-frame ConnectError traceback. Check reachability up front — before
+    # the provider wizard, since the server is a hard prerequisite either way —
+    # and print a one-line hint instead.
+    parsed = urlparse(teasel_url)
+    host = parsed.hostname or "localhost"
+    port = parsed.port or (443 if parsed.scheme == "https" else 80)
+    try:
+        with socket.create_connection((host, port), timeout=2):
+            pass
+    except OSError:
+        err.print(f"[red]Can't reach teasel-server at[/] {teasel_url}")
+        err.print("Start it in another terminal first:  [cyan]teasel-server[/]")
+        raise typer.Exit(1)
+
+    pc = st.resolve_provider(provider, Path.cwd())
+    if pc is None:
+        if provider:
+            console.print(f"[red]No backend named '{provider}' in ~/.teasel/llm.toml.[/red]")
+            raise typer.Exit(1)
+        pc = run_first_run_wizard()
+    try:
+        asyncio.run(run(pc, teasel_url, model))
+    except KeyboardInterrupt:
+        console.print()  # Ctrl-C at the prompt: exit quietly, no traceback
 
 
 def main() -> None:

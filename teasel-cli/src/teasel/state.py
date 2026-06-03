@@ -35,6 +35,19 @@ class InstrumentSetup:
     channels: dict[str, dict] = field(default_factory=dict)
 
 
+@dataclass
+class ProviderConfig:
+    """A named LLM backend bundle stored in ~/.teasel/llm.toml (holds secrets)."""
+    name: str
+    type: str            # cloudflare | ollama | openai-compat
+    model: str = ""
+    account: str = ""    # cloudflare
+    token: str = ""      # cloudflare
+    url: str = ""        # ollama
+    base_url: str = ""   # openai-compat
+    api_key: str = ""    # openai-compat
+
+
 
 def _toml_path(filename: str, directory: Path | None) -> Path:
     return (directory or Path.cwd()) / filename
@@ -65,7 +78,28 @@ def load_netlist_path(directory: Path | None = None) -> str | None:
 def save_netlist_path(netlist: str | None, directory: Path | None = None) -> None:
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
-    path.write_text(_serialize(load(directory), netlist=netlist))
+    path.write_text(_serialize(
+        load(directory), netlist=netlist, llm_provider=load_project_provider(directory)
+    ))
+
+
+# ── Project LLM provider reference (teasel.toml [llm]) ─────────────────────────
+
+def load_project_provider(directory: Path | None = None) -> str | None:
+    """Return the provider name this project pins via teasel.toml [llm].provider."""
+    path = _toml_path(TEASEL_TOML, directory)
+    if not path.exists():
+        return None
+    doc = tomllib.loads(path.read_text())
+    return doc.get("llm", {}).get("provider")
+
+
+def save_project_provider(provider: str | None, directory: Path | None = None) -> None:
+    directory = directory or Path.cwd()
+    path = _toml_path(TEASEL_TOML, directory)
+    path.write_text(_serialize(
+        load(directory), netlist=load_netlist_path(directory), llm_provider=provider
+    ))
 
 
 def find_netlists(directory: Path | None = None) -> list[Path]:
@@ -136,16 +170,28 @@ def save(instruments: list[InstrumentConfig], directory: Path | None = None) -> 
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
     old_text = path.read_text() if path.exists() else ""
-    new_text = _serialize(instruments, netlist=load_netlist_path(directory))
+    new_text = _serialize(
+        instruments,
+        netlist=load_netlist_path(directory),
+        llm_provider=load_project_provider(directory),
+    )
     path.write_text(new_text)
     _append_log(old_text, new_text, directory / TEASEL_LOG, "instruments")
 
 
-def _serialize(instruments: list[InstrumentConfig], netlist: str | None = None) -> str:
+def _serialize(
+    instruments: list[InstrumentConfig],
+    netlist: str | None = None,
+    llm_provider: str | None = None,
+) -> str:
     lines = ["# teasel.toml — lab instruments and connections", ""]
     if netlist is not None:
         lines.append("[project]")
         lines.append(f'netlist = "{_escape(netlist)}"')
+        lines.append("")
+    if llm_provider:
+        lines.append("[llm]")
+        lines.append(f'provider = "{_escape(llm_provider)}"')
         lines.append("")
     for inst in instruments:
         lines.append(f"[instruments.{inst.slug}]")
@@ -203,26 +249,102 @@ def _serialize_setup(setups: list[InstrumentSetup]) -> str:
     return "\n".join(lines)
 
 
-# ── LLM config (~/.teasel/llm.toml) ──────────────────────────────────────────
+# ── LLM provider bundles (~/.teasel/llm.toml) ─────────────────────────────────
+#
+# Single source of truth for inference backends. Each [providers.NAME] block is a
+# self-contained bundle (type + credentials + model); the top-level `default` key
+# names the bundle used when nothing else is specified. Secrets live here only —
+# never in a project's teasel.toml.
 
-def load_llm_config() -> dict:
-    """Return saved LLM config dict (keys: provider, model, cf_account, cf_token, ollama_url)."""
+# Fields serialized for a bundle, in order, after the required `type`.
+_PROVIDER_OPTIONAL_FIELDS = ("model", "account", "token", "url", "base_url", "api_key")
+
+
+def load_providers() -> dict[str, ProviderConfig]:
+    """Return all named provider bundles. Missing/old-shape file → {} (wizard handles it)."""
     if not LLM_CONFIG_PATH.exists():
         return {}
     try:
-        return tomllib.loads(LLM_CONFIG_PATH.read_text()).get("llm", {})
+        doc = tomllib.loads(LLM_CONFIG_PATH.read_text())
     except Exception:
         return {}
+    out: dict[str, ProviderConfig] = {}
+    for name, data in doc.get("providers", {}).items():
+        out[name] = ProviderConfig(
+            name=name,
+            type=str(data.get("type", "")),
+            model=str(data.get("model", "")),
+            account=str(data.get("account", "")),
+            token=str(data.get("token", "")),
+            url=str(data.get("url", "")),
+            base_url=str(data.get("base_url", "")),
+            api_key=str(data.get("api_key", "")),
+        )
+    return out
 
 
-def save_llm_config(cfg: dict) -> None:
-    """Write LLM config to ~/.teasel/llm.toml."""
+def get_default_provider() -> str | None:
+    """Return the name of the default bundle, or None."""
+    if not LLM_CONFIG_PATH.exists():
+        return None
+    try:
+        return tomllib.loads(LLM_CONFIG_PATH.read_text()).get("default")
+    except Exception:
+        return None
+
+
+def save_provider(pc: ProviderConfig, make_default: bool = False) -> None:
+    """Upsert a bundle. Becomes default if asked, or if it's the first bundle."""
+    providers = load_providers()
+    providers[pc.name] = pc
+    default = get_default_provider()
+    if make_default or default is None:
+        default = pc.name
+    _write_providers(providers, default)
+
+
+def set_default_provider(name: str) -> None:
+    providers = load_providers()
+    if name in providers:
+        _write_providers(providers, name)
+
+
+def delete_provider(name: str) -> None:
+    providers = load_providers()
+    if name not in providers:
+        return
+    del providers[name]
+    default = get_default_provider()
+    if default == name:
+        default = next(iter(providers), None)
+    _write_providers(providers, default)
+
+
+def resolve_provider(
+    cli_provider: str | None = None, directory: Path | None = None
+) -> ProviderConfig | None:
+    """Pick a bundle: --provider > teasel.toml [llm].provider > default. None → run wizard."""
+    name = cli_provider or load_project_provider(directory) or get_default_provider()
+    if not name:
+        return None
+    return load_providers().get(name)
+
+
+def _write_providers(providers: dict[str, ProviderConfig], default: str | None) -> None:
     LLM_CONFIG_PATH.parent.mkdir(exist_ok=True)
-    lines = ["[llm]"]
-    for k, v in cfg.items():
-        if v:
-            lines.append(f'{k} = "{_escape(str(v))}"')
-    LLM_CONFIG_PATH.write_text("\n".join(lines) + "\n")
+    lines: list[str] = []
+    if default:
+        lines.append(f'default = "{_escape(default)}"')
+        lines.append("")
+    for name, pc in providers.items():
+        lines.append(f"[providers.{name}]")
+        lines.append(f'type = "{_escape(pc.type)}"')
+        for fld in _PROVIDER_OPTIONAL_FIELDS:
+            val = getattr(pc, fld)
+            if val:
+                lines.append(f'{fld} = "{_escape(str(val))}"')
+        lines.append("")
+    LLM_CONFIG_PATH.write_text("\n".join(lines))
 
 
 # ── Instance naming ───────────────────────────────────────────────────────────

@@ -5,13 +5,19 @@ import re
 import subprocess
 from pathlib import Path
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
 
 from . import config as cfg
 from . import get_version
 from . import state as st
-from .local_llm import CF_DEFAULT_MODEL
+from .local_llm import (
+    CF_DEFAULT_MODEL,
+    CLAUDE_DEFAULT_MODEL,
+    DEFAULT_TEASEL_URL,
+    chat_session,
+    client_from_provider,
+)
 from .registry import DriverDescriptor, fetch_driver, fetch_index
 
 app = FastAPI(title="teasel", version=get_version())
@@ -221,6 +227,7 @@ def index(saved: str = "") -> HTMLResponse:
     </hgroup>
     {content}
     <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
+      <a href="/chat" role="button" hx-boost="false">Chat with your lab</a>
       <a href="/registry" role="button" class="outline">⊕ Add device</a>
       <a href="/settings/llm" style="font-size:.875rem;color:var(--pico-muted-color)">⚙ LLM settings</a>
     </div>
@@ -632,6 +639,134 @@ def api_instruments() -> list[dict]:
     ]
 
 
+# ── Chat (/chat and /ws/chat) ─────────────────────────────────────────────────
+#
+# In-browser chat that drives the connected instruments. The forge loop in
+# local_llm.py runs the teasel-server MCP tools; its on_message events are
+# streamed here as JSON envelopes over a WebSocket and rendered as bubbles
+# (user/assistant), monospace tool-call/result traces, guardrail lines, and
+# errors. Raw string so the inline CSS/JS braces and `\n` survive verbatim into
+# the page.
+
+_CHAT_BODY = r"""
+<hgroup>
+  <h2>Lab chat</h2>
+  <p class="muted" id="chat-status">connecting…</p>
+</hgroup>
+<style>
+  #chat-log{height:55vh;overflow-y:auto;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);padding:.75rem;display:flex;flex-direction:column;gap:.5rem;margin-bottom:.75rem;background:var(--pico-card-background-color)}
+  #chat-log .msg{max-width:85%;padding:.4rem .65rem;border-radius:10px;font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-wrap:break-word}
+  #chat-log .user{align-self:flex-end;background:var(--pico-primary-background);color:var(--pico-primary-inverse);border-bottom-right-radius:3px}
+  #chat-log .assistant{align-self:flex-start;background:var(--pico-code-background-color);border-bottom-left-radius:3px}
+  #chat-log .trace{align-self:flex-start;font-family:ui-monospace,monospace;font-size:.72rem;color:var(--pico-muted-color);white-space:pre-wrap;word-break:break-all;max-width:100%}
+  #chat-log .guardrail{align-self:flex-start;font-size:.75rem;color:var(--pico-color-amber-550)}
+  #chat-log .error{align-self:flex-start;font-size:.82rem;color:var(--pico-color-red-550)}
+  #chat-log .empty{margin:auto;color:var(--pico-muted-color);font-size:.85rem;text-align:center}
+</style>
+<div id="chat-log"><div class="empty">Ask teasel to read or drive a connected instrument.</div></div>
+<form id="chat-form" autocomplete="off" hx-boost="false">
+  <fieldset role="group" style="margin:0">
+    <input id="chat-input" name="msg" placeholder="e.g. set the function generator to 10 kHz" disabled>
+    <button id="chat-send" type="submit" disabled style="width:auto">Send</button>
+  </fieldset>
+</form>
+<script>
+(function(){
+  var log=document.getElementById('chat-log');
+  var form=document.getElementById('chat-form');
+  var input=document.getElementById('chat-input');
+  var send=document.getElementById('chat-send');
+  var statusEl=document.getElementById('chat-status');
+  function add(cls,text){
+    var empty=log.querySelector('.empty'); if(empty){empty.remove();}
+    var d=document.createElement('div'); d.className=cls; d.textContent=text;
+    log.appendChild(d); log.scrollTop=log.scrollHeight; return d;
+  }
+  function busy(b){ input.disabled=b; send.disabled=b; if(!b){input.focus();} }
+  var proto=location.protocol==='https:'?'wss:':'ws:';
+  var ws=new WebSocket(proto+'//'+location.host+'/ws/chat?brain=local');
+  ws.onclose=function(){ busy(true); statusEl.textContent='disconnected — reload to reconnect'; };
+  ws.onerror=function(){ statusEl.textContent='connection error'; };
+  ws.onmessage=function(e){
+    var m=JSON.parse(e.data);
+    if(m.type==='ready'){ statusEl.textContent=m.provider+' · '+m.model+' · '+m.tools+' tools'; busy(false); }
+    else if(m.type==='text'){ add('msg assistant', m.text); }
+    else if(m.type==='tool_call'){ m.calls.forEach(function(c){ add('trace','→ '+c.name+'('+JSON.stringify(c.args)+')'); }); }
+    else if(m.type==='tool_result'){ add('trace','← '+(m.text||'').split('\n')[0].slice(0,200)); }
+    else if(m.type==='guardrail'){ add('guardrail','⚠ '+m.label+': '+(m.text||'').split('\n')[0].slice(0,200)); }
+    else if(m.type==='error'){ add('error', m.text); busy(false); }
+    else if(m.type==='done'){ busy(false); }
+  };
+  form.addEventListener('submit',function(ev){
+    ev.preventDefault();
+    var text=input.value.trim();
+    if(!text||ws.readyState!==1){ return; }
+    add('msg user', text);
+    ws.send(text);
+    input.value=''; busy(true);
+  });
+})();
+</script>
+"""
+
+
+@app.get("/chat", response_class=HTMLResponse)
+def chat_page() -> HTMLResponse:
+    return _page(_CHAT_BODY, back="/")
+
+
+@app.websocket("/ws/chat")
+async def ws_chat(websocket: WebSocket) -> None:
+    await websocket.accept()
+
+    # ?brain= seam: only the local forge brain is wired today; the Claude Agent
+    # SDK is a separate increment (different dep + auth path).
+    if websocket.query_params.get("brain", "local") != "local":
+        await websocket.send_json({
+            "type": "error",
+            "text": "Only the local provider brain is wired up right now.",
+        })
+        await websocket.close()
+        return
+
+    pc = st.resolve_provider(None, Path.cwd())
+    if pc is None:
+        await websocket.send_json({
+            "type": "error",
+            "text": "No LLM backend configured. Add one under LLM settings, then reload.",
+        })
+        await websocket.close()
+        return
+
+    client, model = client_from_provider(pc)
+    try:
+        async with chat_session(client, DEFAULT_TEASEL_URL) as session:
+            await websocket.send_json({
+                "type": "ready",
+                "provider": pc.name,
+                "model": model,
+                "tools": session.tool_count,
+            })
+            while True:
+                user_input = (await websocket.receive_text()).strip()
+                if user_input:
+                    await session.run_turn(user_input, websocket.send_json)
+    except WebSocketDisconnect:
+        pass
+    except Exception as exc:
+        # Most likely teasel-server isn't running — surface it instead of a
+        # silent drop. Best-effort; the socket may already be gone.
+        try:
+            await websocket.send_json({
+                "type": "error",
+                "text": f"Could not reach teasel-server at {DEFAULT_TEASEL_URL} ({exc}). "
+                        "Start it with: teasel-server --transport streamable-http",
+            })
+            await websocket.close()
+        except Exception:
+            pass
+
+
 # ── Form field helpers ────────────────────────────────────────────────────────
 
 def _param_fields(driver: DriverDescriptor, existing: dict | None = None) -> str:
@@ -772,104 +907,181 @@ def _save_setup(inst: st.InstrumentConfig, form) -> None:
     st.save_setup(existing)
 
 
-# ── LLM settings (/settings/llm) ─────────────────────────────────────────────
+# ── LLM backends (/settings/llm) ─────────────────────────────────────────────
+
+def _provider_list_html() -> str:
+    providers = st.load_providers()
+    default = st.get_default_provider()
+    if not providers:
+        return '<p class="muted">No backends configured yet — add one below.</p>'
+    rows = ""
+    for pc in providers.values():
+        is_default = pc.name == default
+        star = ' <small style="color:var(--pico-primary)">★ default</small>' if is_default else ""
+        set_default = "" if is_default else f"""
+            <form method="post" action="/settings/llm/default" style="display:inline;margin:0">
+              <input type="hidden" name="name" value="{pc.name}">
+              <button class="outline" style="padding:.1rem .5rem;font-size:.7rem;margin:0">Set default</button>
+            </form>"""
+        rows += f"""
+        <tr>
+          <td><strong>{pc.name}</strong>{star}</td>
+          <td>{pc.type}</td>
+          <td><code style="font-size:.75rem">{pc.model or '—'}</code></td>
+          <td style="text-align:right;white-space:nowrap">
+            <a href="/settings/llm?edit={pc.name}" role="button" class="outline" style="padding:.1rem .5rem;font-size:.7rem">Edit</a>
+            {set_default}
+            <form method="post" action="/settings/llm/delete" style="display:inline;margin:0" onsubmit="return confirm('Delete {pc.name}?')">
+              <input type="hidden" name="name" value="{pc.name}">
+              <button class="outline secondary" style="padding:.1rem .5rem;font-size:.7rem;margin:0">Delete</button>
+            </form>
+          </td>
+        </tr>"""
+    return f"""
+    <table>
+      <thead><tr><th>Name</th><th>Type</th><th>Model</th><th></th></tr></thead>
+      <tbody>{rows}</tbody>
+    </table>"""
+
 
 @app.get("/settings/llm", response_class=HTMLResponse)
-def llm_settings(saved: str = "") -> HTMLResponse:
-    cfg = st.load_llm_config()
-    provider = cfg.get("provider", "ollama")
-    model = cfg.get("model", "")
-    ollama_url = cfg.get("ollama_url", "http://localhost:11434")
-    cf_account = cfg.get("cf_account", "")
-    cf_token_raw = cfg.get("cf_token", "")
-    cf_token_display = (cf_token_raw[:8] + "••••••••") if cf_token_raw else ""
+def llm_settings(saved: str = "", edit: str = "") -> HTMLResponse:
+    banner = _banner("LLM backend saved.") if saved else ""
+    editing = st.load_providers().get(edit) if edit else None
+    ptype = editing.type if editing else "cloudflare"
 
-    banner = _banner("LLM settings saved.") if saved else ""
+    account = editing.account if editing else ""
+    url = editing.url if editing else "http://localhost:11434"
+    base_url = editing.base_url if editing else ""
+    model = editing.model if editing else ""
+    token_ph = "•••• (kept if blank)" if editing and editing.token else "Cloudflare API token"
+    key_ph = "•••• (kept if blank)" if editing and editing.api_key else "API key (blank if none)"
+    model_ph = CLAUDE_DEFAULT_MODEL if ptype == "anthropic" else CF_DEFAULT_MODEL
 
-    ollama_hidden = "" if provider == "ollama" else ' style="display:none"'
-    cf_hidden = "" if provider == "cloudflare" else ' style="display:none"'
+    def hide(t: str) -> str:
+        return "" if ptype == t else ' style="display:none"'
+
+    def checked(t: str) -> str:
+        return "checked" if ptype == t else ""
+
+    if editing:
+        name_field = (
+            f'<p>Editing <strong>{editing.name}</strong> '
+            f'<a href="/settings/llm" style="font-size:.8rem">cancel</a></p>'
+            f'<input type="hidden" name="name" value="{editing.name}">'
+        )
+        form_title = "Edit backend"
+        submit_label = "Save changes"
+    else:
+        name_field = (
+            '<label>Name <small class="muted">lowercase, hyphens</small>'
+            '<input name="name" placeholder="cf-mistral" required></label>'
+        )
+        form_title = "Add backend"
+        submit_label = "Add backend"
 
     body = f"""
     {banner}
     <hgroup>
-      <h2>LLM Settings</h2>
-      <p>Configure the inference backend for <code>teasel local</code> and optional server-side data preprocessing.</p>
+      <h2>LLM backends</h2>
+      <p>Inference backends for <code>teasel local</code>. The default is used unless a project's
+         <code>teasel.toml</code> names another via <code>[llm] provider</code>.</p>
     </hgroup>
-    <form method="post" action="/settings/llm">
+    {_provider_list_html()}
+
+    <article>
+    <h3 style="margin-top:0">{form_title}</h3>
+    <form method="post" action="/settings/llm/save">
+      {name_field}
       <fieldset>
-        <legend>Provider</legend>
-        <label>
-          <input type="radio" name="provider" value="ollama"
-            {"checked" if provider == "ollama" else ""}
-            onchange="document.getElementById('ollama-fields').style.display='';document.getElementById('cf-fields').style.display='none'">
-          Ollama / llama-server (local)
-        </label>
-        <label>
-          <input type="radio" name="provider" value="cloudflare"
-            {"checked" if provider == "cloudflare" else ""}
-            onchange="document.getElementById('cf-fields').style.display='';document.getElementById('ollama-fields').style.display='none'">
-          Cloudflare Workers AI
-        </label>
+        <legend>Backend type</legend>
+        <label><input type="radio" name="type" value="cloudflare" {checked("cloudflare")} onchange="llmType('cloudflare')"> Cloudflare Workers AI</label>
+        <label><input type="radio" name="type" value="ollama" {checked("ollama")} onchange="llmType('ollama')"> Ollama / llama-server (local)</label>
+        <label><input type="radio" name="type" value="openai-compat" {checked("openai-compat")} onchange="llmType('openai-compat')"> OpenAI-compatible endpoint</label>
+        <label><input type="radio" name="type" value="anthropic" {checked("anthropic")} onchange="llmType('anthropic')"> Anthropic (Claude)</label>
       </fieldset>
 
-      <div id="ollama-fields"{ollama_hidden}>
-        <label>
-          Ollama URL
-          <input name="ollama_url" value="{ollama_url}" placeholder="http://localhost:11434">
-        </label>
-        <label>
-          Model
-          <input name="ollama_model" value="{model if provider == "ollama" else ""}" placeholder="qwen2.5:3b">
-        </label>
+      <div id="cf-fields"{hide("cloudflare")}>
+        <label>Account ID <input name="account" value="{account}" placeholder="Cloudflare account ID"></label>
+        <label>API Token <input name="token" value="" placeholder="{token_ph}">
+          <small class="muted">Leave blank to keep existing token.</small></label>
       </div>
 
-      <div id="cf-fields"{cf_hidden}>
-        <label>
-          Account ID
-          <input name="cf_account" value="{cf_account}" placeholder="Cloudflare account ID">
-        </label>
-        <label>
-          API Token
-          <input name="cf_token" value="" placeholder="{cf_token_display or "Cloudflare API token"}">
-          <small class="muted">Leave blank to keep existing token.</small>
-        </label>
-        <label>
-          Model
-          <input name="cf_model" value="{model if provider == "cloudflare" else ""}"
-            placeholder="{CF_DEFAULT_MODEL}">
-        </label>
+      <div id="ollama-fields"{hide("ollama")}>
+        <label>Ollama URL <input name="url" value="{url}" placeholder="http://localhost:11434"></label>
       </div>
 
-      <button type="submit">Save</button>
+      <div id="oc-fields"{hide("openai-compat")}>
+        <label>Base URL <input name="base_url" value="{base_url}" placeholder="https://…/v1"></label>
+        <label>API Key <input name="api_key" value="" placeholder="{key_ph}">
+          <small class="muted">Leave blank to keep existing / if none.</small></label>
+      </div>
+
+      <div id="anthropic-fields"{hide("anthropic")}>
+        <label>API Key <input name="anthropic_key" value="" placeholder="{key_ph}">
+          <small class="muted">Anthropic API key. Leave blank to keep existing.</small></label>
+      </div>
+
+      <label>Model <input name="model" value="{model}" placeholder="{model_ph}"></label>
+      <button type="submit">{submit_label}</button>
     </form>
+    </article>
+
     <p class="muted" style="margin-top:1rem;font-size:.8rem">
       Credentials are stored in <code>~/.teasel/llm.toml</code> (outside the project directory).
     </p>
+    <script>
+    function llmType(t){{
+      document.getElementById('cf-fields').style.display = t==='cloudflare'?'':'none';
+      document.getElementById('ollama-fields').style.display = t==='ollama'?'':'none';
+      document.getElementById('oc-fields').style.display = t==='openai-compat'?'':'none';
+      document.getElementById('anthropic-fields').style.display = t==='anthropic'?'':'none';
+      var mi=document.querySelector('input[name=model]');
+      if(mi) mi.placeholder = t==='anthropic' ? '{CLAUDE_DEFAULT_MODEL}' : t==='cloudflare' ? '{CF_DEFAULT_MODEL}' : 'model name';
+    }}
+    </script>
     """
     return _page(body, back="/")
 
 
-@app.post("/settings/llm")
+@app.post("/settings/llm/save")
 async def llm_settings_save(request: Request) -> RedirectResponse:
     form = await request.form()
-    provider = str(form.get("provider", "ollama"))
-    cfg: dict = {"provider": provider}
+    name = str(form.get("name", "")).strip()
+    ptype = str(form.get("type", "cloudflare"))
+    if not name:
+        return RedirectResponse("/settings/llm", status_code=303)
 
-    if provider == "cloudflare":
-        cfg["cf_account"] = str(form.get("cf_account", "")).strip()
-        new_token = str(form.get("cf_token", "")).strip()
-        if new_token:
-            cfg["cf_token"] = new_token
-        else:
-            cfg["cf_token"] = st.load_llm_config().get("cf_token", "")
-        model = str(form.get("cf_model", "")).strip()
-        if model:
-            cfg["model"] = model
-    else:
-        cfg["ollama_url"] = str(form.get("ollama_url", "http://localhost:11434")).strip()
-        model = str(form.get("ollama_model", "")).strip()
-        if model:
-            cfg["model"] = model
+    existing = st.load_providers().get(name)
+    pc = st.ProviderConfig(name=name, type=ptype, model=str(form.get("model", "")).strip())
 
-    st.save_llm_config(cfg)
+    if ptype == "cloudflare":
+        pc.account = str(form.get("account", "")).strip()
+        token = str(form.get("token", "")).strip()
+        pc.token = token or (existing.token if existing else "")
+    elif ptype == "openai-compat":
+        pc.base_url = str(form.get("base_url", "")).strip()
+        key = str(form.get("api_key", "")).strip()
+        pc.api_key = key or (existing.api_key if existing else "")
+    elif ptype == "anthropic":
+        key = str(form.get("anthropic_key", "")).strip()
+        pc.api_key = key or (existing.api_key if existing else "")
+    else:  # ollama
+        pc.url = str(form.get("url", "")).strip()
+
+    st.save_provider(pc)
+    return RedirectResponse("/settings/llm?saved=1", status_code=303)
+
+
+@app.post("/settings/llm/default")
+async def llm_set_default(request: Request) -> RedirectResponse:
+    form = await request.form()
+    st.set_default_provider(str(form.get("name", "")).strip())
+    return RedirectResponse("/settings/llm?saved=1", status_code=303)
+
+
+@app.post("/settings/llm/delete")
+async def llm_delete(request: Request) -> RedirectResponse:
+    form = await request.form()
+    st.delete_provider(str(form.get("name", "")).strip())
     return RedirectResponse("/settings/llm?saved=1", status_code=303)
