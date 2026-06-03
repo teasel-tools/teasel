@@ -721,6 +721,7 @@ _PROVIDER_TYPES = [
     ("Cloudflare Workers AI", "cloudflare"),
     ("Ollama / llama-server", "ollama"),
     ("OpenAI-compatible", "openai-compat"),
+    ("Anthropic (Claude)", "anthropic"),
 ]
 
 
@@ -801,7 +802,9 @@ class ProviderWizardScreen(Screen):
 
     def __init__(self, name: str | None = None) -> None:
         super().__init__()
-        self.name = name
+        # NB: don't assign to ``self.name`` — Textual's Widget.name is a
+        # read-only property (8.x), so that raises on construction.
+        self.provider_name = name
         self.existing = st.load_providers().get(name) if name else None
 
     def compose(self) -> ComposeResult:
@@ -848,6 +851,13 @@ class ProviderWizardScreen(Screen):
                     id="p-api-key", classes="param-input",
                 )
 
+            with Container(id="anthropic-fields"):
+                yield Label("[bold]Anthropic API key[/]  [dim]leave blank to keep existing[/]")
+                yield _Input(
+                    password=True, placeholder="•••• (kept if blank)" if pc and pc.api_key else "",
+                    id="p-anthropic-key", classes="param-input",
+                )
+
             yield Label("[bold]Model[/]")
             yield _Input(value=pc.model if pc else "", id="p-model", classes="param-input")
         yield Button("Save", id="btn-save", variant="primary")
@@ -864,6 +874,7 @@ class ProviderWizardScreen(Screen):
         self.query_one("#cf-fields").display = ptype == "cloudflare"
         self.query_one("#ollama-fields").display = ptype == "ollama"
         self.query_one("#oc-fields").display = ptype == "openai-compat"
+        self.query_one("#anthropic-fields").display = ptype == "anthropic"
 
     def action_save(self) -> None:
         self._save()
@@ -873,7 +884,7 @@ class ProviderWizardScreen(Screen):
         self._save()
 
     def _save(self) -> None:
-        name = self.name or self.query_one("#p-name", Input).value.strip()
+        name = self.provider_name or self.query_one("#p-name", Input).value.strip()
         if not name:
             self.notify("Name is required.", severity="error")
             return
@@ -888,6 +899,9 @@ class ProviderWizardScreen(Screen):
         elif ptype == "openai-compat":
             pc.base_url = self.query_one("#p-base-url", Input).value.strip()
             key = self.query_one("#p-api-key", Input).value.strip()
+            pc.api_key = key or (self.existing.api_key if self.existing else "")
+        elif ptype == "anthropic":
+            key = self.query_one("#p-anthropic-key", Input).value.strip()
             pc.api_key = key or (self.existing.api_key if self.existing else "")
         else:  # ollama
             pc.url = self.query_one("#p-url", Input).value.strip()
