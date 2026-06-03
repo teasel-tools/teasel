@@ -1,0 +1,18 @@
+# Pre-commit hooks for the teasel monorepo.
+#
+# One-time setup per clone:
+#   uv tool install pre-commit   # if not already installed
+#   pre-commit install           # wire the git hook
+#
+# Run manually against the whole tree:
+#   pre-commit run --all-files
+#
+# Update pinned hook versions:
+#   pre-commit autoupdate
+
+repos:
+  # Secret scanning — blocks the commit if a credential/token is detected.
+  - repo: https://github.com/gitleaks/gitleaks
+    rev: v8.30.1
+    hooks:
+      - id: gitleaks
