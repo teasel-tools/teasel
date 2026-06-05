@@ -1014,7 +1014,7 @@ wheels = [
 
 [[package]]
 name = "teasel"
-version = "0.3.0"
+version = "0.3.1"
 source = { editable = "teasel-cli" }
 dependencies = [
     { name = "anthropic" },

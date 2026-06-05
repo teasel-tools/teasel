@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
 from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
 from . import get_version
@@ -21,6 +22,27 @@ from .local_llm import (
 from .registry import DriverDescriptor, fetch_driver, fetch_index
 
 app = FastAPI(title="teasel", version=get_version())
+
+_STATIC_DIR = Path(__file__).parent / "static"
+app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+# Current PCB probe point — ephemeral, single local user. Set when a net is
+# clicked in /pcb; prepended to each chat turn so the LLM knows which net the
+# user is physically probing. None = nothing selected.
+_probe: dict | None = None
+
+
+def _with_probe(user_input: str) -> str:
+    """Prepend the current probe point (if any) to a chat turn so the LLM knows
+    which PCB net the user is physically probing."""
+    if not _probe:
+        return user_input
+    net = _probe.get("netname") or "?"
+    return (
+        f'[probe context] The user is currently probing PCB net "{net}" on the '
+        f"loaded board. Treat measurement/simulation questions as referring to this "
+        f"net unless they say otherwise.\n\n{user_input}"
+    )
 
 
 # ── Template helpers ──────────────────────────────────────────────────────────
@@ -228,6 +250,7 @@ def index(saved: str = "") -> HTMLResponse:
     {content}
     <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
       <a href="/chat" role="button" hx-boost="false">Chat with your lab</a>
+      <a href="/pcb" role="button" class="outline" hx-boost="false">PCB probe</a>
       <a href="/registry" role="button" class="outline">⊕ Add device</a>
       <a href="/settings/llm" style="font-size:.875rem;color:var(--pico-muted-color)">⚙ LLM settings</a>
     </div>
@@ -653,6 +676,7 @@ _CHAT_BODY = r"""
   <h2>Lab chat</h2>
   <p class="muted" id="chat-status">connecting…</p>
 </hgroup>
+<p id="chat-probe" class="muted" style="margin:-.4rem 0 .5rem;font-size:.82rem"></p>
 <style>
   #chat-log{height:55vh;overflow-y:auto;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);padding:.75rem;display:flex;flex-direction:column;gap:.5rem;margin-bottom:.75rem;background:var(--pico-card-background-color)}
   #chat-log .msg{max-width:85%;padding:.4rem .65rem;border-radius:10px;font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-wrap:break-word}
@@ -677,6 +701,10 @@ _CHAT_BODY = r"""
   var input=document.getElementById('chat-input');
   var send=document.getElementById('chat-send');
   var statusEl=document.getElementById('chat-status');
+  var probeEl=document.getElementById('chat-probe');
+  fetch('/pcb/probe').then(function(r){return r.json();}).then(function(d){
+    if(d&&d.probe&&d.probe.netname){ probeEl.textContent='📍 Probing net '+d.probe.netname+' — attached to your messages.'; }
+  }).catch(function(){});
   function add(cls,text){
     var empty=log.querySelector('.empty'); if(empty){empty.remove();}
     var d=document.createElement('div'); d.className=cls; d.textContent=text;
@@ -750,7 +778,7 @@ async def ws_chat(websocket: WebSocket) -> None:
             while True:
                 user_input = (await websocket.receive_text()).strip()
                 if user_input:
-                    await session.run_turn(user_input, websocket.send_json)
+                    await session.run_turn(_with_probe(user_input), websocket.send_json)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -765,6 +793,144 @@ async def ws_chat(websocket: WebSocket) -> None:
             await websocket.close()
         except Exception:
             pass
+
+
+# ── PCB probe (/pcb) ──────────────────────────────────────────────────────────
+#
+# Loads a .kicad_pcb into the patched kicanvas viewer (vendored bundle, KiCad 9
+# named-net + probe-only patch). The board renders entirely client-side — only
+# the clicked net name is POSTed to /pcb/probe and held server-side, then folded
+# into the next lab-chat turn via _with_probe(). Raw string so the inline JS
+# braces survive verbatim.
+
+_PCB_BODY = r"""
+<style>
+  body{max-width:1100px}
+  #pcb-toolbar{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem}
+  #pcb-view{height:66vh;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);overflow:hidden;background:var(--pico-card-background-color)}
+  #pcb-view kicanvas-embed{display:block;width:100%;height:100%}
+  #pcb-view .ph{padding:1rem;color:var(--pico-muted-color);font-size:.85rem}
+  #probe-bar{display:flex;align-items:center;gap:.6rem;margin:.6rem 0;font-size:.9rem}
+  #probe-net{font-family:ui-monospace,monospace;font-weight:600;color:var(--pico-color-jade-550)}
+  #probe-bar.empty #probe-net{color:var(--pico-muted-color);font-weight:400}
+  label.file-btn{margin:0}
+</style>
+<hgroup>
+  <h2>PCB probe</h2>
+  <p class="muted">Load a board, then click a net — pad, track, or via — to tell the lab chat where you're probing.</p>
+</hgroup>
+<div id="pcb-toolbar">
+  <label class="file-btn" role="button">
+    Load .kicad_pcb…
+    <input id="pcb-file" type="file" accept=".kicad_pcb" hidden>
+  </label>
+  <span id="pcb-name" class="muted"></span>
+</div>
+<div id="probe-bar" class="empty">
+  <span>📍 Probing:</span>
+  <span id="probe-net">nothing selected</span>
+  <button id="probe-clear" class="secondary outline" style="width:auto;padding:.1rem .5rem;font-size:.8rem;display:none">clear</button>
+  <span style="flex:1"></span>
+  <a href="/chat" role="button" class="outline" style="width:auto" hx-boost="false">Open lab chat →</a>
+</div>
+<div id="pcb-view"><p class="ph">No board loaded.</p></div>
+<script type="module" src="/static/vendor/kicanvas.js"></script>
+<script>
+(function(){
+  var view=document.getElementById('pcb-view');
+  var bar=document.getElementById('probe-bar');
+  var netEl=document.getElementById('probe-net');
+  var clearBtn=document.getElementById('probe-clear');
+  var nameEl=document.getElementById('pcb-name');
+
+  function showProbe(net){
+    if(net){ netEl.textContent=net; bar.classList.remove('empty'); clearBtn.style.display='inline-block'; }
+    else { netEl.textContent='nothing selected'; bar.classList.add('empty'); clearBtn.style.display='none'; }
+  }
+  function postProbe(sel){
+    fetch('/pcb/probe',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(sel||{})}).catch(function(){});
+    showProbe(sel && sel.netname);
+  }
+  clearBtn.addEventListener('click',function(){ postProbe(null); });
+
+  // reflect any probe already set on the server
+  fetch('/pcb/probe').then(function(r){return r.json();}).then(function(d){
+    if(d && d.probe && d.probe.netname) showProbe(d.probe.netname);
+  }).catch(function(){});
+
+  function deepFind(selector, root){
+    root=root||document;
+    var d=root.querySelector(selector); if(d) return d;
+    var all=root.querySelectorAll('*');
+    for(var i=0;i<all.length;i++){ if(all[i].shadowRoot){ var f=deepFind(selector, all[i].shadowRoot); if(f) return f; } }
+    return null;
+  }
+  var isNetInfo=function(o){ return o && typeof o==='object' && 'net' in o
+      && o.__lookupGetter__ && o.__lookupGetter__('netname')!==undefined; };
+
+  var installedOn=null;
+  function installWrap(){
+    var tries=0;
+    (function poll(){
+      var vEl=deepFind('kc-board-viewer');
+      var viewer=vEl && vEl.viewer;
+      if(viewer && viewer.board && viewer.handleItemClick && installedOn!==viewer){
+        var orig=viewer.handleItemClick.bind(viewer);
+        viewer.handleItemClick=function(item){
+          try{ orig(item); }catch(e){ console.warn('[pcb] viewer threw:', e.message); }
+          try{
+            if(isNetInfo(item)){
+              var name=item.netname;
+              if(name!=null) postProbe({netname:name, number:(item.net && item.net.number!=null)?item.net.number:item.net});
+            }
+          }catch(e){ console.warn('[pcb] probe extract failed:', e.message); }
+        };
+        // single click always resolves (auto-pick first on overlap)
+        viewer.contextMenuCallback=function(x,y,items,onSelect){ onSelect(items.values().next().value); };
+        installedOn=viewer;
+        return;
+      }
+      if(tries++<80) setTimeout(poll,100);
+    })();
+  }
+
+  document.getElementById('pcb-file').addEventListener('change', async function(e){
+    var file=e.target.files[0]; if(!file) return;
+    nameEl.textContent=file.name;
+    installedOn=null;
+    var text=await file.text();
+    var embed=document.createElement('kicanvas-embed');
+    embed.setAttribute('controls','full');
+    var src=document.createElement('kicanvas-source');
+    src.setAttribute('name', file.name.endsWith('.kicad_pcb')?file.name:file.name+'.kicad_pcb');
+    src.textContent=text;
+    embed.appendChild(src);
+    view.replaceChildren(embed);
+    installWrap();
+  });
+})();
+</script>
+"""
+
+
+@app.get("/pcb", response_class=HTMLResponse)
+def pcb_page() -> HTMLResponse:
+    return _page(_PCB_BODY, back="/")
+
+
+@app.post("/pcb/probe")
+async def set_probe(request: Request) -> dict:
+    global _probe
+    data = await request.json()
+    net = (data.get("netname") or "").strip()
+    _probe = {"netname": net, "number": data.get("number")} if net else None
+    return {"ok": True, "probe": _probe}
+
+
+@app.get("/pcb/probe")
+def get_probe() -> dict:
+    return {"probe": _probe}
 
 
 # ── Form field helpers ────────────────────────────────────────────────────────

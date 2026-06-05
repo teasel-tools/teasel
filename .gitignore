@@ -10,3 +10,4 @@ teasel.log
 teasel.toml
 teasel-output/
 
+*.log
