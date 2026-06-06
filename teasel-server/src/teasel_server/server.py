@@ -431,4 +431,9 @@ def main():
     mcp.add_tool(_get_setup, name="get_setup")
     if args.transport == "streamable-http":
         print(f"Listening on {args.host}:{args.port}")
-    mcp.run(transport=args.transport)
+    try:
+        mcp.run(transport=args.transport)
+    except KeyboardInterrupt:
+        # Ctrl-C: anyio re-raises KeyboardInterrupt after the loop is cancelled.
+        # Exit quietly instead of dumping a traceback.
+        print("\nShutting down.")

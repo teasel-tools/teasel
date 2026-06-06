@@ -224,17 +224,45 @@ def load_setup(directory: Path | None = None) -> list[InstrumentSetup]:
     ]
 
 
-def save_setup(setups: list[InstrumentSetup], directory: Path | None = None) -> None:
+# Sentinel so save_setup() preserves the existing [board] ref unless told otherwise.
+_KEEP = object()
+
+
+def save_setup(
+    setups: list[InstrumentSetup],
+    directory: Path | None = None,
+    board_file: object = _KEEP,
+) -> None:
     directory = directory or Path.cwd()
     path = _toml_path(SETUP_TOML, directory)
     old_text = path.read_text() if path.exists() else ""
-    new_text = _serialize_setup(setups)
+    if board_file is _KEEP:
+        board_file = load_board_file(directory)
+    new_text = _serialize_setup(setups, board_file)
     path.write_text(new_text)
     _append_log(old_text, new_text, directory / TEASEL_LOG, "setup")
 
 
-def _serialize_setup(setups: list[InstrumentSetup]) -> str:
-    lines = ["# setup.toml — experiment configuration (probes, limits, labels)", ""]
+def load_board_file(directory: Path | None = None) -> str | None:
+    """Return the project board filename recorded in setup.toml [board].file, or None."""
+    path = _toml_path(SETUP_TOML, directory)
+    if not path.exists():
+        return None
+    doc = tomllib.loads(path.read_text())
+    return doc.get("board", {}).get("file") or None
+
+
+def save_board_file(filename: str | None, directory: Path | None = None) -> None:
+    """Set (or clear, if None) the [board].file reference, preserving everything else."""
+    save_setup(load_setup(directory), directory, board_file=filename)
+
+
+def _serialize_setup(setups: list[InstrumentSetup], board_file: str | None = None) -> str:
+    lines = ["# setup.toml — experiment configuration (probes, limits, labels, board)", ""]
+    if board_file:
+        lines.append("[board]")
+        lines.append(f'file = "{_escape(board_file)}"')
+        lines.append("")
     for s in setups:
         if s.limits:
             lines.append(f"[instruments.{s.slug}.limits]")

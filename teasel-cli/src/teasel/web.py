@@ -26,23 +26,72 @@ app = FastAPI(title="teasel", version=get_version())
 _STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
-# Current PCB probe point — ephemeral, single local user. Set when a net is
-# clicked in /pcb; prepended to each chat turn so the LLM knows which net the
-# user is physically probing. None = nothing selected.
-_probe: dict | None = None
+# Probe map — which PCB nets are wired to which instrument channels. This is NOT
+# ephemeral state: it lives in setup.toml (the file for probe wiring), under each
+# channel block as `net`/`role`. The /pcb panel reads/writes it; each chat turn is
+# prefixed with the map so the LLM knows where the user is measuring/driving.
+#
+# Channel templates per instrument type → [(channel_key, display, default_role)].
+# role: "probe" = measured/output, "input" = driven/stimulus.
+_CHANNEL_TEMPLATES: dict[str, list[tuple[str, str, str]]] = {
+    "oscilloscope": [("C1", "C1", "probe"), ("C2", "C2", "probe"),
+                     ("C3", "C3", "probe"), ("C4", "C4", "probe")],
+    "function-generator": [("output", "Main", "input"), ("ttl", "TTL", "input")],
+}
 
 
-def _with_probe(user_input: str) -> str:
-    """Prepend the current probe point (if any) to a chat turn so the LLM knows
-    which PCB net the user is physically probing."""
-    if not _probe:
+def _probe_channels() -> list[dict]:
+    """Every assignable channel across connected instruments, each carrying its
+    current net/role from setup.toml. Empty ⇒ no instruments configured."""
+    setups = {s.slug: s for s in st.load_setup()}
+    out: list[dict] = []
+    for inst in st.load():
+        setup = setups.get(inst.slug)
+        template = _CHANNEL_TEMPLATES.get(inst.type, [("main", "", "probe")])
+        for ch_key, disp, default_role in template:
+            cfg = setup.channels.get(ch_key, {}) if setup else {}
+            out.append({
+                "instrument": inst.slug,
+                "channel": ch_key,
+                "label": f"{inst.slug} · {disp}" if disp else inst.slug,
+                "default_role": default_role,
+                "net": cfg.get("net", ""),
+                "role": cfg.get("role", default_role),
+            })
+    return out
+
+
+def _probe_map() -> list[dict]:
+    """The active map: every instrument channel that has a net assigned."""
+    return [
+        {"netname": ch["net"], "role": ch["role"], "instrument": ch["instrument"],
+         "channel": ch["channel"], "label": ch["label"]}
+        for ch in _probe_channels() if ch["net"]
+    ]
+
+
+def _with_probes(user_input: str) -> str:
+    """Prepend the probe map (if any) to a chat turn so the LLM knows which PCB nets
+    are measured (probe) vs driven (input) and on which channels. A malformed
+    setup.toml must never break a chat turn — degrade to the bare input."""
+    try:
+        rows = _probe_map()
+        if not rows:
+            return user_input
+        lines = []
+        for r in rows:
+            if r["role"] == "input":
+                lines.append(f'- net "{r["netname"]}" is DRIVEN (input/stimulus) by {r["label"]}')
+            else:
+                lines.append(f'- net "{r["netname"]}" is MEASURED (probe/output) on {r["label"]}')
+        body = "\n".join(lines)
+        return (
+            f"[probe map] The user has wired these PCB nets to lab instruments:\n{body}\n"
+            f"Treat measurement/simulation questions as referring to these nets/channels "
+            f"unless they say otherwise.\n\n{user_input}"
+        )
+    except Exception:
         return user_input
-    net = _probe.get("netname") or "?"
-    return (
-        f'[probe context] The user is currently probing PCB net "{net}" on the '
-        f"loaded board. Treat measurement/simulation questions as referring to this "
-        f"net unless they say otherwise.\n\n{user_input}"
-    )
 
 
 # ── Template helpers ──────────────────────────────────────────────────────────
@@ -51,9 +100,48 @@ _MOON = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox=
 _SUN  = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/><line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/><line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/><line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/></svg>'
 
 
-def _page(body: str, back: str | None = None) -> HTMLResponse:
+_TAB_SCRIPT = """
+  <script>
+  (function(){
+    var tabs=['instruments','board','chat'];
+    function show(name){
+      if(tabs.indexOf(name)<0) name='instruments';
+      tabs.forEach(function(t){
+        var panel=document.getElementById('tab-'+t);
+        var link=document.querySelector('.tab-link[data-tab="'+t+'"]');
+        if(panel) panel.classList.toggle('active', t===name);
+        if(link) link.classList.toggle('active', t===name);
+      });
+      try{ localStorage.setItem('teasel-tab', name); }catch(e){}
+      window.dispatchEvent(new CustomEvent('teasel:tab',{detail:{tab:name}}));
+    }
+    document.querySelectorAll('.tab-link').forEach(function(a){
+      a.addEventListener('click',function(e){
+        e.preventDefault(); var t=a.getAttribute('data-tab');
+        history.replaceState(null,'','#'+t); show(t);
+      });
+    });
+    function stored(){ try{ return localStorage.getItem('teasel-tab'); }catch(e){ return null; } }
+    var initial=(location.hash||'').replace('#','') || stored() || 'instruments';
+    show(initial);
+    window.addEventListener('hashchange',function(){ show((location.hash||'').replace('#','')); });
+  })();
+  </script>
+"""
+
+
+def _page(body: str, back: str | None = None, active_tab: str | None = None) -> HTMLResponse:
     ver = get_version()
     back_html = f'<li><a href="{back}" style="font-size:.9em">← Back</a></li>' if back else ""
+    nav_mid = (
+        '<ul>'
+        '<li><a href="#instruments" class="tab-link" data-tab="instruments">Instruments</a></li>'
+        '<li><a href="#board" class="tab-link" data-tab="board">Board</a></li>'
+        '<li><a href="#chat" class="tab-link" data-tab="chat">Chat</a></li>'
+        '</ul>'
+    ) if active_tab else ""
+    body_class = "app-shell" if active_tab else ""
+    tab_script = _TAB_SCRIPT if active_tab else ""
     return HTMLResponse(f"""<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -98,6 +186,13 @@ def _page(body: str, back: str | None = None) -> HTMLResponse:
     #theme-toggle:hover {{ color: var(--pico-color); }}
     [data-theme="dark"]  #icon-moon {{ display: none; }}
     [data-theme="light"] #icon-sun  {{ display: none; }}
+    /* Tabs / app shell */
+    body.app-shell {{ max-width: 1100px; }}
+    nav .tab-link {{ color: var(--pico-muted-color); padding-bottom: .15rem; border-bottom: 2px solid transparent; }}
+    nav .tab-link:hover {{ color: var(--pico-color); }}
+    nav .tab-link.active {{ color: var(--pico-color); font-weight: 600; border-bottom-color: var(--pico-primary); }}
+    .tab-panel {{ display: none; }}
+    .tab-panel.active {{ display: block; }}
     /* Utilities */
     .muted {{ color: var(--pico-muted-color); font-size: .85em; }}
     mark.green {{ background: none; color: var(--pico-color-jade-550); }}
@@ -116,10 +211,11 @@ def _page(body: str, back: str | None = None) -> HTMLResponse:
     .limit-row label {{ margin-bottom: 0; }}
   </style>
 </head>
-<body hx-boost="true">
+<body hx-boost="true" class="{body_class}">
   <header>
     <nav>
       <ul><li><a href="/"><strong>teasel</strong></a></li></ul>
+      {nav_mid}
       <ul>
         {back_html}
         <li>
@@ -143,6 +239,7 @@ def _page(body: str, back: str | None = None) -> HTMLResponse:
       localStorage.setItem('teasel-theme', next);
     }};
   </script>
+  {tab_script}
 </body>
 </html>""")
 
@@ -178,6 +275,16 @@ def _registry_rows(entries, installed: set[str], q: str = "") -> str:
 
 @app.get("/", response_class=HTMLResponse)
 def index(saved: str = "") -> HTMLResponse:
+    """Single-page shell: Instruments / Board / Chat panels, tab-switched client-side."""
+    shell = (
+        f'<section id="tab-instruments" class="tab-panel">{_instruments_panel(saved)}</section>'
+        f'<section id="tab-board" class="tab-panel">{_PCB_BODY}</section>'
+        f'<section id="tab-chat" class="tab-panel">{_CHAT_BODY}</section>'
+    )
+    return _page(shell, active_tab="instruments")
+
+
+def _instruments_panel(saved: str = "") -> str:
     instruments = st.load()
     setups = {s.slug: s for s in st.load_setup()}
     netlist_path = st.get_netlist_path()
@@ -241,7 +348,7 @@ def index(saved: str = "") -> HTMLResponse:
       </form>
     </details>"""
 
-    body = f"""
+    return f"""
     {banner}
     <hgroup>
       <h2>Connected Instruments</h2>
@@ -249,14 +356,11 @@ def index(saved: str = "") -> HTMLResponse:
     </hgroup>
     {content}
     <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
-      <a href="/chat" role="button" hx-boost="false">Chat with your lab</a>
-      <a href="/pcb" role="button" class="outline" hx-boost="false">PCB probe</a>
       <a href="/registry" role="button" class="outline">⊕ Add device</a>
       <a href="/settings/llm" style="font-size:.875rem;color:var(--pico-muted-color)">⚙ LLM settings</a>
     </div>
     {netlist_section}
     """
-    return _page(body)
 
 
 @app.get("/instrument/{slug}", response_class=HTMLResponse)
@@ -702,9 +806,18 @@ _CHAT_BODY = r"""
   var send=document.getElementById('chat-send');
   var statusEl=document.getElementById('chat-status');
   var probeEl=document.getElementById('chat-probe');
-  fetch('/pcb/probe').then(function(r){return r.json();}).then(function(d){
-    if(d&&d.probe&&d.probe.netname){ probeEl.textContent='📍 Probing net '+d.probe.netname+' — attached to your messages.'; }
-  }).catch(function(){});
+  function refreshProbe(){
+    fetch('/pcb/probes').then(function(r){return r.json();}).then(function(d){
+      var rows=(d&&d.probes)||[];
+      if(!rows.length){ probeEl.textContent=''; return; }
+      var parts=rows.map(function(p){ return p.netname+'→'+(p.channel||p.instrument); });
+      probeEl.textContent='📍 '+rows.length+' net'+(rows.length>1?'s':'')+' mapped — '+parts.join(', ')+' — attached to your messages.';
+    }).catch(function(){});
+  }
+  refreshProbe();
+  window.addEventListener('teasel:probes-changed', refreshProbe);
+  // refresh whenever the Chat tab becomes active, however we got here
+  window.addEventListener('teasel:tab', function(e){ if(e.detail && e.detail.tab==='chat') refreshProbe(); });
   function add(cls,text){
     var empty=log.querySelector('.empty'); if(empty){empty.remove();}
     var d=document.createElement('div'); d.className=cls; d.textContent=text;
@@ -738,9 +851,10 @@ _CHAT_BODY = r"""
 """
 
 
-@app.get("/chat", response_class=HTMLResponse)
-def chat_page() -> HTMLResponse:
-    return _page(_CHAT_BODY, back="/")
+@app.get("/chat")
+def chat_page() -> RedirectResponse:
+    # Chat now lives in the single-page shell; keep the old URL working.
+    return RedirectResponse("/#chat", status_code=307)
 
 
 @app.websocket("/ws/chat")
@@ -778,7 +892,7 @@ async def ws_chat(websocket: WebSocket) -> None:
             while True:
                 user_input = (await websocket.receive_text()).strip()
                 if user_input:
-                    await session.run_turn(_with_probe(user_input), websocket.send_json)
+                    await session.run_turn(_with_probes(user_input), websocket.send_json)
     except WebSocketDisconnect:
         pass
     except Exception as exc:
@@ -798,26 +912,36 @@ async def ws_chat(websocket: WebSocket) -> None:
 # ── PCB probe (/pcb) ──────────────────────────────────────────────────────────
 #
 # Loads a .kicad_pcb into the patched kicanvas viewer (vendored bundle, KiCad 9
-# named-net + probe-only patch). The board renders entirely client-side — only
-# the clicked net name is POSTed to /pcb/probe and held server-side, then folded
-# into the next lab-chat turn via _with_probe(). Raw string so the inline JS
-# braces survive verbatim.
+# named-net + probe-only patch). The board renders entirely client-side — only the
+# clicked net name is POSTed to /pcb/probes and written into setup.toml, then folded
+# into the next lab-chat turn via _with_probes(). Raw string so the inline JS braces
+# survive verbatim.
 
 _PCB_BODY = r"""
 <style>
-  body{max-width:1100px}
   #pcb-toolbar{display:flex;gap:.75rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem}
-  #pcb-view{height:66vh;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);overflow:hidden;background:var(--pico-card-background-color)}
+  #pcb-main{display:flex;gap:1rem;align-items:stretch;flex-wrap:wrap}
+  #pcb-view{flex:1 1 460px;min-width:0;height:66vh;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);overflow:hidden;background:var(--pico-card-background-color)}
   #pcb-view kicanvas-embed{display:block;width:100%;height:100%}
   #pcb-view .ph{padding:1rem;color:var(--pico-muted-color);font-size:.85rem}
-  #probe-bar{display:flex;align-items:center;gap:.6rem;margin:.6rem 0;font-size:.9rem}
-  #probe-net{font-family:ui-monospace,monospace;font-weight:600;color:var(--pico-color-jade-550)}
-  #probe-bar.empty #probe-net{color:var(--pico-muted-color);font-weight:400}
+  /* fixed-width panel so labels don't reflow the layout as nets/channels change */
+  #probe-panel{flex:0 0 340px;max-width:340px;min-width:0;display:flex;flex-direction:column}
+  #probe-panel h3{margin-bottom:.5rem}
+  #probe-table{font-size:.82rem;margin-bottom:.5rem;table-layout:fixed;width:100%}
+  #probe-table td{padding:.25rem .35rem;vertical-align:middle}
+  #probe-table .net{width:7rem;font-family:ui-monospace,monospace;font-weight:600;color:var(--pico-color-jade-550);overflow-wrap:anywhere}
+  #probe-table .role-col{width:4.8rem}
+  #probe-table .x-col{width:1.7rem}
+  #probe-table select{font-size:.78rem;padding:.15rem .3rem;margin:0;width:100%;max-width:100%}
+  #probe-table .clear-x{width:100%}
+  #probe-table tr.flash{animation:probeflash 1s ease}
+  @keyframes probeflash{from{background:var(--pico-primary-background)}to{background:transparent}}
+  #probe-empty,#probe-nochan{font-size:.8rem;margin:.25rem 0 .75rem}
   label.file-btn{margin:0}
 </style>
 <hgroup>
   <h2>PCB probe</h2>
-  <p class="muted">Load a board, then click a net — pad, track, or via — to tell the lab chat where you're probing.</p>
+  <p class="muted">Load a board, then click nets — pads, tracks, vias — and assign each to an instrument channel as a probe (measured) or input (driven).</p>
 </hgroup>
 <div id="pcb-toolbar">
   <label class="file-btn" role="button">
@@ -825,40 +949,135 @@ _PCB_BODY = r"""
     <input id="pcb-file" type="file" accept=".kicad_pcb" hidden>
   </label>
   <span id="pcb-name" class="muted"></span>
+  <button id="pcb-clear-board" class="secondary outline" style="width:auto;padding:.1rem .55rem;font-size:.8rem;display:none">Clear board</button>
 </div>
-<div id="probe-bar" class="empty">
-  <span>📍 Probing:</span>
-  <span id="probe-net">nothing selected</span>
-  <button id="probe-clear" class="secondary outline" style="width:auto;padding:.1rem .5rem;font-size:.8rem;display:none">clear</button>
-  <span style="flex:1"></span>
-  <a href="/chat" role="button" class="outline" style="width:auto" hx-boost="false">Open lab chat →</a>
+<div id="pcb-main">
+  <div id="pcb-view"><p class="ph">No board loaded.</p></div>
+  <div id="probe-panel">
+    <h3>Probe map</h3>
+    <table id="probe-table"><tbody></tbody></table>
+    <p id="probe-empty" class="muted">Click a net on the board to add it here.</p>
+    <p id="probe-nochan" class="muted" style="display:none">Add an instrument under the Instruments tab to assign channels.</p>
+    <span style="flex:1"></span>
+    <a href="#chat" role="button" class="outline" style="width:auto;margin-top:.5rem">Open lab chat →</a>
+  </div>
 </div>
-<div id="pcb-view"><p class="ph">No board loaded.</p></div>
 <script type="module" src="/static/vendor/kicanvas.js"></script>
 <script>
 (function(){
   var view=document.getElementById('pcb-view');
-  var bar=document.getElementById('probe-bar');
-  var netEl=document.getElementById('probe-net');
-  var clearBtn=document.getElementById('probe-clear');
   var nameEl=document.getElementById('pcb-name');
+  var clearBoardBtn=document.getElementById('pcb-clear-board');
+  var fileInput=document.getElementById('pcb-file');
+  var tbody=document.querySelector('#probe-table tbody');
+  var emptyEl=document.getElementById('probe-empty');
+  var nochanEl=document.getElementById('probe-nochan');
 
-  function showProbe(net){
-    if(net){ netEl.textContent=net; bar.classList.remove('empty'); clearBtn.style.display='inline-block'; }
-    else { netEl.textContent='nothing selected'; bar.classList.add('empty'); clearBtn.style.display='none'; }
-  }
-  function postProbe(sel){
-    fetch('/pcb/probe',{method:'POST',headers:{'Content-Type':'application/json'},
-      body:JSON.stringify(sel||{})}).catch(function(){});
-    showProbe(sel && sel.netname);
-  }
-  clearBtn.addEventListener('click',function(){ postProbe(null); });
+  // ── probe-map state (source of truth = setup.toml via /pcb/probes) ──
+  var channels=[];   // [{instrument, channel, label, default_role, ...}]
+  var probes=[];     // [{netname, role, instrument, channel}]
+  var chanKey=function(c){ return c.instrument+'::'+c.channel; };
 
-  // reflect any probe already set on the server
-  fetch('/pcb/probe').then(function(r){return r.json();}).then(function(d){
-    if(d && d.probe && d.probe.netname) showProbe(d.probe.netname);
+  function usedKeys(exceptNet){
+    return probes.filter(function(p){return p.netname!==exceptNet;})
+                 .map(function(p){return p.instrument+'::'+p.channel;});
+  }
+  var roleOf=function(c){ return c.default_role || 'probe'; };
+  function channelsForRole(role){
+    return channels.filter(function(c){ return roleOf(c)===role; });
+  }
+  function firstFreeChannelForRole(role){
+    var used=usedKeys(null);
+    return channelsForRole(role).filter(function(c){ return used.indexOf(chanKey(c))<0; })[0] || null;
+  }
+  function save(){
+    fetch('/pcb/probes',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(probes)})
+      .then(function(r){return r.json();})
+      .then(function(d){ probes=d.probes||[]; renderTable();
+        window.dispatchEvent(new CustomEvent('teasel:probes-changed')); })
+      .catch(function(){});
+  }
+  function opt(value,label,selected,disabled){
+    var o=document.createElement('option'); o.value=value; o.textContent=label;
+    if(selected)o.selected=true; if(disabled)o.disabled=true; return o;
+  }
+  function renderTable(){
+    tbody.innerHTML='';
+    probes.forEach(function(p){
+      var tr=document.createElement('tr'); tr.setAttribute('data-net',p.netname);
+      var tdN=document.createElement('td'); tdN.className='net'; tdN.textContent=p.netname; tr.appendChild(tdN);
+      var tdR=document.createElement('td'); tdR.className='role-col';
+      var rs=document.createElement('select'); rs.className='role-sel';
+      rs.appendChild(opt('probe','Probe',p.role==='probe',false));
+      rs.appendChild(opt('input','Input',p.role==='input',false));
+      rs.addEventListener('change',function(){
+        p.role=rs.value;
+        // role drives the channel list — switch to a valid channel if the current
+        // one can't serve this role (e.g. a scope can't be an input).
+        var curKey=p.instrument+'::'+p.channel;
+        var curOk=channels.some(function(c){ return chanKey(c)===curKey && roleOf(c)===p.role; });
+        if(!curOk){
+          var free=firstFreeChannelForRole(p.role) || channelsForRole(p.role)[0] || null;
+          p.instrument=free?free.instrument:''; p.channel=free?free.channel:'';
+        }
+        save();
+      });
+      tdR.appendChild(rs); tr.appendChild(tdR);
+      var tdC=document.createElement('td');
+      var cs=document.createElement('select'); cs.className='chan-sel';
+      var used=usedKeys(p.netname), curKey=p.instrument+'::'+p.channel;
+      var pick=channelsForRole(p.role);
+      // keep the current channel visible even if it doesn't match the role
+      if(p.instrument && !pick.some(function(c){return chanKey(c)===curKey;})){
+        var cur=channels.filter(function(c){return chanKey(c)===curKey;})[0];
+        if(cur) pick=[cur].concat(pick);
+      }
+      if(!pick.length){ cs.appendChild(opt('','— no '+p.role+' channels —',true,true)); }
+      pick.forEach(function(c){
+        var key=chanKey(c), sel=(key===curKey);
+        cs.appendChild(opt(key, c.label, sel, !sel && used.indexOf(key)>=0));
+      });
+      cs.disabled=!channels.length || !pick.length;
+      cs.addEventListener('change',function(){
+        var k=cs.value.split('::'); p.instrument=k[0]||''; p.channel=k[1]||''; save();
+      });
+      tdC.appendChild(cs); tr.appendChild(tdC);
+      var tdX=document.createElement('td'); tdX.className='x-col';
+      var bx=document.createElement('button'); bx.className='clear-x'; bx.title='Remove'; bx.textContent='×';
+      bx.addEventListener('click',function(){
+        probes=probes.filter(function(q){return q.netname!==p.netname;}); save();
+      });
+      tdX.appendChild(bx); tr.appendChild(tdX);
+      tbody.appendChild(tr);
+    });
+    emptyEl.style.display=probes.length?'none':'';
+    nochanEl.style.display=channels.length?'none':'';
+  }
+  function flashRow(net){
+    var tr=tbody.querySelector('tr[data-net="'+(window.CSS&&CSS.escape?CSS.escape(net):net)+'"]');
+    if(tr){ tr.classList.remove('flash'); void tr.offsetWidth; tr.classList.add('flash'); }
+  }
+  function addProbe(netname){
+    if(!netname) return;
+    if(probes.some(function(p){return p.netname===netname;})){ flashRow(netname); return; }
+    if(!channels.length){ nochanEl.style.display=''; return; }
+    // clicking a net to add it = probing by default; grab a free probe channel,
+    // else any free channel (and adopt its natural role).
+    var role='probe', c=firstFreeChannelForRole('probe');
+    if(!c){ c=channelsForRole('probe')[0]; }
+    if(!c){ var any=channels.filter(function(x){return usedKeys(null).indexOf(chanKey(x))<0;});
+            c=any[0]||channels[0]; role=c?roleOf(c):'probe'; }
+    probes.push({netname:netname, role:role,
+                 instrument:c?c.instrument:'', channel:c?c.channel:''});
+    save();
+  }
+  // initial load of channels + current map
+  fetch('/pcb/probes').then(function(r){return r.json();}).then(function(d){
+    channels=d.channels||[]; probes=d.probes||[]; renderTable();
   }).catch(function(){});
 
+  // ── kicanvas board: render, persist (IndexedDB), lazy on tab activation ──
   function deepFind(selector, root){
     root=root||document;
     var d=root.querySelector(selector); if(d) return d;
@@ -879,12 +1098,8 @@ _PCB_BODY = r"""
         var orig=viewer.handleItemClick.bind(viewer);
         viewer.handleItemClick=function(item){
           try{ orig(item); }catch(e){ console.warn('[pcb] viewer threw:', e.message); }
-          try{
-            if(isNetInfo(item)){
-              var name=item.netname;
-              if(name!=null) postProbe({netname:name, number:(item.net && item.net.number!=null)?item.net.number:item.net});
-            }
-          }catch(e){ console.warn('[pcb] probe extract failed:', e.message); }
+          try{ if(isNetInfo(item) && item.netname!=null) addProbe(item.netname); }
+          catch(e){ console.warn('[pcb] probe extract failed:', e.message); }
         };
         // single click always resolves (auto-pick first on overlap)
         viewer.contextMenuCallback=function(x,y,items,onSelect){ onSelect(items.values().next().value); };
@@ -894,43 +1109,165 @@ _PCB_BODY = r"""
       if(tries++<80) setTimeout(poll,100);
     })();
   }
-
-  document.getElementById('pcb-file').addEventListener('change', async function(e){
-    var file=e.target.files[0]; if(!file) return;
-    nameEl.textContent=file.name;
+  function renderBoard(text, name){
+    nameEl.textContent=name||'';
     installedOn=null;
-    var text=await file.text();
     var embed=document.createElement('kicanvas-embed');
     embed.setAttribute('controls','full');
     var src=document.createElement('kicanvas-source');
-    src.setAttribute('name', file.name.endsWith('.kicad_pcb')?file.name:file.name+'.kicad_pcb');
+    src.setAttribute('name', name && name.endsWith('.kicad_pcb')?name:(name||'board')+'.kicad_pcb');
     src.textContent=text;
     embed.appendChild(src);
     view.replaceChildren(embed);
+    clearBoardBtn.style.display='inline-block';
     installWrap();
+    setTimeout(function(){ window.dispatchEvent(new Event('resize')); },60);
+  }
+  function placeholder(){
+    var p=document.createElement('p'); p.className='ph'; p.textContent='No board loaded.';
+    view.replaceChildren(p);
+  }
+
+  // Board persists in the project: stored as a real .kicad_pcb file and referenced
+  // from setup.toml [board]. Loaded lazily on first Board-tab activation so the
+  // WebGL canvas isn't sized while hidden.
+  var savedBoard=null, rendered=false, boardActive=false;
+  function maybeRender(){
+    if(boardActive && !rendered && savedBoard && savedBoard.content){
+      renderBoard(savedBoard.content, savedBoard.name); rendered=true;
+    }
+    if(boardActive){ setTimeout(function(){ window.dispatchEvent(new Event('resize')); },60); }
+  }
+  window.addEventListener('teasel:tab', function(e){
+    boardActive=!!(e.detail && e.detail.tab==='board'); maybeRender();
+  });
+  fetch('/pcb/board').then(function(r){return r.json();}).then(function(d){
+    if(d && d.name && d.content){ savedBoard=d; maybeRender(); }
+  }).catch(function(){});
+
+  fileInput.addEventListener('change', async function(e){
+    var file=e.target.files[0]; if(!file) return;
+    var text=await file.text();
+    savedBoard={name:file.name, content:text};
+    renderBoard(text, file.name); rendered=true;
+    fetch('/pcb/board',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify(savedBoard)})
+      .then(function(r){return r.json();})
+      .then(function(d){ if(d && d.name){ savedBoard.name=d.name; nameEl.textContent=d.name; } })
+      .catch(function(){});
+  });
+  clearBoardBtn.addEventListener('click', function(){
+    fetch('/pcb/board/clear',{method:'POST'}).catch(function(){});
+    savedBoard=null; rendered=false; installedOn=null;
+    placeholder(); nameEl.textContent=''; clearBoardBtn.style.display='none';
   });
 })();
 </script>
 """
 
 
-@app.get("/pcb", response_class=HTMLResponse)
-def pcb_page() -> HTMLResponse:
-    return _page(_PCB_BODY, back="/")
+@app.get("/pcb")
+def pcb_page() -> RedirectResponse:
+    # Board now lives in the single-page shell; keep the old URL working.
+    return RedirectResponse("/#board", status_code=307)
 
 
-@app.post("/pcb/probe")
-async def set_probe(request: Request) -> dict:
-    global _probe
+@app.get("/pcb/probes")
+def get_probes() -> dict:
+    return {"probes": _probe_map(), "channels": _probe_channels()}
+
+
+@app.post("/pcb/probes")
+async def set_probes(request: Request) -> dict:
+    """Replace the whole probe map. Body is a list of {netname, role, instrument,
+    channel}. We clear net/role from every channel, then write the posted rows into
+    setup.toml — preserving each channel's label/probe (one net ↔ one channel)."""
+    payload = await request.json()
+    rows = payload if isinstance(payload, list) else payload.get("probes", [])
+
+    setups = st.load_setup()
+    by_slug = {s.slug: s for s in setups}
+    # Only accept (instrument, channel) pairs that are real channels on connected
+    # instruments. This enforces "strictly from instruments" server-side and keeps
+    # untrusted client values out of TOML section keys (corruption guard).
+    valid = {(c["instrument"], c["channel"]) for c in _probe_channels()}
+
+    # clear existing assignments (keep label/probe)
+    for s in setups:
+        for cfg in s.channels.values():
+            cfg.pop("net", None)
+            cfg.pop("role", None)
+
+    seen: set[str] = set()
+    for row in rows:
+        net = (row.get("netname") or "").strip()
+        inst = (row.get("instrument") or "").strip()
+        ch = (row.get("channel") or "").strip()
+        role = "input" if (row.get("role") or "").strip() == "input" else "probe"
+        if not net or net in seen or (inst, ch) not in valid:
+            continue
+        seen.add(net)
+        s = by_slug.get(inst)
+        if s is None:
+            s = st.InstrumentSetup(slug=inst)
+            by_slug[inst] = s
+            setups.append(s)
+        cfg = dict(s.channels.get(ch, {}))
+        cfg["net"] = net
+        cfg["role"] = role
+        s.channels[ch] = cfg
+
+    # drop channel blocks left empty after clearing
+    for s in setups:
+        s.channels = {k: v for k, v in s.channels.items() if v}
+
+    st.save_setup(setups)
+    return {"ok": True, "probes": _probe_map()}
+
+
+# ── PCB board file (stored in the project, referenced from setup.toml [board]) ──
+
+@app.get("/pcb/board")
+def get_board() -> dict:
+    """Return the project board (filename + content) referenced by setup.toml, if any."""
+    name = st.load_board_file()
+    if not name:
+        return {"name": None}
+    # Defend against a hand-edited setup.toml with a traversal path — only serve a
+    # plain .kicad_pcb from the project dir.
+    name = Path(name).name
+    if not name.endswith(".kicad_pcb"):
+        return {"name": None}
+    path = Path.cwd() / name
+    if not path.exists():
+        return {"name": None}
+    try:
+        return {"name": name, "content": path.read_text(errors="replace")}
+    except Exception:
+        return {"name": None}
+
+
+@app.post("/pcb/board")
+async def set_board(request: Request) -> dict:
+    """Persist an uploaded board: write it as a real .kicad_pcb in the project dir and
+    record [board].file in setup.toml. Board content stays out of teasel.toml/setup.toml."""
     data = await request.json()
-    net = (data.get("netname") or "").strip()
-    _probe = {"netname": net, "number": data.get("number")} if net else None
-    return {"ok": True, "probe": _probe}
+    name = Path((data.get("name") or "").strip()).name  # strip any path components
+    content = data.get("content") or ""
+    if not name or not content:
+        return {"ok": False}
+    if not name.endswith(".kicad_pcb"):
+        name += ".kicad_pcb"
+    (Path.cwd() / name).write_text(content)
+    st.save_board_file(name)
+    return {"ok": True, "name": name}
 
 
-@app.get("/pcb/probe")
-def get_probe() -> dict:
-    return {"probe": _probe}
+@app.post("/pcb/board/clear")
+def clear_board() -> dict:
+    # Clear the project reference; leave the .kicad_pcb file on disk.
+    st.save_board_file(None)
+    return {"ok": True}
 
 
 # ── Form field helpers ────────────────────────────────────────────────────────
@@ -1044,7 +1381,6 @@ def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str
 
 def _save_setup(inst: st.InstrumentConfig, form) -> None:
     limits: dict[str, float] = {}
-    channels: dict[str, dict] = {}
     for key in ("amplitude_max", "frequency_max"):
         val = str(form.get(f"limit_{key}", "")).strip()
         if val:
@@ -1052,23 +1388,39 @@ def _save_setup(inst: st.InstrumentConfig, form) -> None:
                 limits[key] = float(val)
             except ValueError:
                 pass
+
+    # Merge into the prior setup so net/role (owned by the /pcb probe map) survive
+    # this label/probe rewrite.
+    setups = st.load_setup()
+    prior = next((s for s in setups if s.slug == inst.slug), None)
+    prior_channels = prior.channels if prior else {}
+
+    def merged(ch: str, **fields: str) -> dict:
+        cfg = dict(prior_channels.get(ch, {}))
+        for k, v in fields.items():
+            if v:
+                cfg[k] = v
+            else:
+                cfg.pop(k, None)
+        return cfg
+
+    channels: dict[str, dict] = {}
     if inst.type == "function-generator":
         for ch in ("output", "ttl"):
-            lbl = str(form.get(f"ch_{ch}_label", "")).strip()
-            if lbl:
-                channels[ch] = {"label": lbl}
+            cfg = merged(ch, label=str(form.get(f"ch_{ch}_label", "")).strip())
+            if cfg:
+                channels[ch] = cfg
     else:
         for ch in ("C1", "C2", "C3", "C4"):
-            probe = str(form.get(f"ch_{ch}_probe", "")).strip()
-            ch_label = str(form.get(f"ch_{ch}_label", "")).strip()
-            ch_data: dict = {}
-            if probe:
-                ch_data["probe"] = probe
-            if ch_label:
-                ch_data["label"] = ch_label
-            if ch_data:
-                channels[ch] = ch_data
-    existing = [s for s in st.load_setup() if s.slug != inst.slug]
+            cfg = merged(
+                ch,
+                probe=str(form.get(f"ch_{ch}_probe", "")).strip(),
+                label=str(form.get(f"ch_{ch}_label", "")).strip(),
+            )
+            if cfg:
+                channels[ch] = cfg
+
+    existing = [s for s in setups if s.slug != inst.slug]
     existing.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
     st.save_setup(existing)
 
