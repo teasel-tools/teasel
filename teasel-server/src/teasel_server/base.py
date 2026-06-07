@@ -76,3 +76,14 @@ class OscilloscopeBase(InstrumentBase):
 
     def screenshot(self) -> bytes:
         raise NotImplementedError(f"{self.name} does not support screenshots")
+
+
+class SimulatorBase(InstrumentBase):
+    """A virtual instrument: simulates a circuit node and returns a waveform in the
+    same WaveformData shape the scope uses, so sim and bench captures are comparable."""
+
+    @abstractmethod
+    def simulate(self, node: str, analysis: str = "tran") -> WaveformData: ...
+
+    @abstractmethod
+    def list_nodes(self) -> list[str]: ...

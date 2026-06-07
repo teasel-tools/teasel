@@ -15,7 +15,14 @@ def output_dir() -> Path:
 
 def write_waveform(data: WaveformData) -> Path:
     ts = datetime.now().strftime("%Y%m%d_%H%M%S_%f")[:21]
-    path = output_dir() / f"waveform_ch{data.channel}_{ts}.csv"
+    # Simulated traces carry a "node" in metadata → name them distinctly so the web
+    # overlay can tell a sim trace from a bench capture.
+    node = (data.metadata or {}).get("node")
+    if node:
+        safe = "".join(c if c.isalnum() else "_" for c in str(node))
+        path = output_dir() / f"sim_{safe}_{ts}.csv"
+    else:
+        path = output_dir() / f"waveform_ch{data.channel}_{ts}.csv"
     with open(path, "w", newline="") as f:
         writer = csv.writer(f)
         writer.writerow(["time_s", f"voltage_{data.units}"])

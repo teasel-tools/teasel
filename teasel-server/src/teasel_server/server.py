@@ -22,7 +22,7 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-from .base import FunctionGeneratorBase, InstrumentBase, OscilloscopeBase
+from .base import FunctionGeneratorBase, InstrumentBase, OscilloscopeBase, SimulatorBase
 from .llm import LLMClient
 from .output import write_screenshot, write_waveform
 
@@ -260,9 +260,50 @@ def _register_oscilloscope(driver: OscilloscopeBase) -> None:
     mcp.add_tool(with_setup_check(make_screenshot(driver)), name=f"{slug}_screenshot")
 
 
+def _register_simulator(driver: SimulatorBase) -> None:
+    slug = getattr(driver, "instance_name", driver.slug)
+
+    def make_simulate(d):
+        def simulate(node: str, analysis: str = "tran") -> str:
+            try:
+                data = d.simulate(node, analysis)
+                path = write_waveform(data)
+                n = len(data.voltage_data)
+                if not n:
+                    return f"Simulation produced no samples for node '{node}'."
+                v_min, v_max = min(data.voltage_data), max(data.voltage_data)
+                v_mean = sum(data.voltage_data) / n
+                return (
+                    f"Simulated node '{node}': {v_max - v_min:.4g} Vpp, mean {v_mean:.4g} V, "
+                    f"{n} pts. Saved to {path}"
+                )
+            except Exception as e:
+                return f"Error: {e}"
+        simulate.__doc__ = (
+            f"Simulate a circuit node with {d.name} on the project's SPICE netlist. "
+            "Args: node: net/node name (e.g. 'VOUT'); analysis: 'tran' (default). "
+            "Saves the waveform to CSV and returns stats + path."
+        )
+        return simulate
+
+    def make_list_nodes(d):
+        def list_nodes() -> str:
+            try:
+                nodes = d.list_nodes()
+                return ", ".join(nodes) if nodes else "No nodes found."
+            except Exception as e:
+                return f"Error: {e}"
+        list_nodes.__doc__ = f"List the simulatable nodes in {d.name}'s current netlist."
+        return list_nodes
+
+    mcp.add_tool(with_setup_check(make_simulate(driver)), name=f"{slug}_simulate")
+    mcp.add_tool(with_setup_check(make_list_nodes(driver)), name=f"{slug}_list_nodes")
+
+
 _REGISTRARS = {
     FunctionGeneratorBase: _register_function_generator,
     OscilloscopeBase: _register_oscilloscope,
+    SimulatorBase: _register_simulator,
 }
 
 
@@ -404,6 +445,23 @@ def main():
         print(f"Using setup: {args.setup}")
 
     _state.drivers = _load_drivers(teasel_config, setup_config)
+
+    # Always offer the SPICE simulator (a virtual instrument), pointed at the project
+    # dir so it can resolve project.toml [netlist].path live. Activated by setting a
+    # netlist under Settings → Simulation; simulate() reports that until then.
+    if not any(getattr(d, "slug", "") == "spice" for d in _state.drivers):
+        try:
+            from .instruments.spice.driver import SpiceSimulator
+            project_dir = str(args.setup.parent) if args.setup else "."
+            sim = SpiceSimulator({"PROJECT_DIR": project_dir})
+            sim.instance_name = "spice"
+            sim._limits = {}
+            _state.drivers.append(sim)
+            print(f"Loaded driver: {sim.name} as 'spice'")
+        except Exception as e:
+            print(f"Failed to load SPICE simulator: {e} (see {_log_file})")
+            _log.exception("Failed to load SPICE simulator")
+
     if not _state.drivers:
         print("No instrument drivers found. Install driver packages and try again.")
     for driver in _state.drivers:

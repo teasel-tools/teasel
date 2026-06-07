@@ -17,6 +17,7 @@ dependencies = [
     "numpy>=1.24.0",
     "psutil>=5.9.0",
     "pyserial>=3.5",
+    "spicelib>=1.6.1",
 ]
 
 [project.scripts]
@@ -27,6 +28,7 @@ lecroy-wavesurfer = "teasel_server.instruments.lecroy_wavesurfer.driver:LecroyWa
 pm5190 = "teasel_server.instruments.pm5190.driver:PM5190Driver"
 dummy-fg = "teasel_server.instruments.dummy.driver:DummyFunctionGenerator"
 dummy-scope = "teasel_server.instruments.dummy.driver:DummyOscilloscope"
+spice = "teasel_server.instruments.spice.driver:SpiceSimulator"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/teasel_server"]
