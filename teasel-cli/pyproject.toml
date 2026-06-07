@@ -21,6 +21,7 @@ dependencies = [
     "websockets>=12",
     "anthropic>=0.40",
     "forge-guardrails>=0.7.4",
+    "tomli-w>=1.2.0",
 ]
 
 [project.scripts]

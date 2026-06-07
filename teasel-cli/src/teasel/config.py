@@ -1,14 +1,14 @@
 import json
 from pathlib import Path
 
-from .state import InstrumentConfig, SETUP_TOML
+from .state import InstrumentConfig, PROJECT_TOML
 
 
 def apply(instruments: list[InstrumentConfig], output_dir: Path | None = None) -> Path:
     output_dir = output_dir or Path.cwd()
     mcp_path = output_dir / ".mcp.json"
     config_path = (output_dir / "teasel.toml").resolve()
-    setup_path = (output_dir / SETUP_TOML).resolve()
+    setup_path = (output_dir / PROJECT_TOML).resolve()
 
     existing: dict = {}
     if mcp_path.exists():

@@ -1,7 +1,9 @@
 """Web UI for teasel — FastAPI + htmx + Pico CSS."""
 
 import asyncio
+import json
 import re
+import shutil
 import subprocess
 from pathlib import Path
 
@@ -26,10 +28,10 @@ app = FastAPI(title="teasel", version=get_version())
 _STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
 
-# Probe map — which PCB nets are wired to which instrument channels. This is NOT
-# ephemeral state: it lives in setup.toml (the file for probe wiring), under each
-# channel block as `net`/`role`. The /pcb panel reads/writes it; each chat turn is
-# prefixed with the map so the LLM knows where the user is measuring/driving.
+# Probe map — which PCB nets are wired to which instrument channels. Not ephemeral:
+# it's stored per-board in project.toml ([boards."<file>".probes]), so switching
+# boards swaps maps. The /pcb panel reads/writes it; each chat turn is prefixed with
+# the current board's map so the LLM knows where the user is measuring/driving.
 #
 # Channel templates per instrument type → [(channel_key, display, default_role)].
 # role: "probe" = measured/output, "input" = driven/stimulus.
@@ -41,39 +43,46 @@ _CHANNEL_TEMPLATES: dict[str, list[tuple[str, str, str]]] = {
 
 
 def _probe_channels() -> list[dict]:
-    """Every assignable channel across connected instruments, each carrying its
-    current net/role from setup.toml. Empty ⇒ no instruments configured."""
-    setups = {s.slug: s for s in st.load_setup()}
+    """Every assignable channel across connected instruments. Empty ⇒ no
+    instruments configured. (Net/role assignments live in the per-board probe map,
+    not here.)"""
     out: list[dict] = []
     for inst in st.load():
-        setup = setups.get(inst.slug)
         template = _CHANNEL_TEMPLATES.get(inst.type, [("main", "", "probe")])
         for ch_key, disp, default_role in template:
-            cfg = setup.channels.get(ch_key, {}) if setup else {}
             out.append({
                 "instrument": inst.slug,
                 "channel": ch_key,
                 "label": f"{inst.slug} · {disp}" if disp else inst.slug,
                 "default_role": default_role,
-                "net": cfg.get("net", ""),
-                "role": cfg.get("role", default_role),
             })
     return out
 
 
 def _probe_map() -> list[dict]:
-    """The active map: every instrument channel that has a net assigned."""
-    return [
-        {"netname": ch["net"], "role": ch["role"], "instrument": ch["instrument"],
-         "channel": ch["channel"], "label": ch["label"]}
-        for ch in _probe_channels() if ch["net"]
-    ]
+    """The active map for the currently-loaded board: net → channel/role, with a
+    display label joined from the channel list."""
+    rows = st.load_probes(st.load_board_file())
+    if not rows:
+        return []
+    labels = {(c["instrument"], c["channel"]): c["label"] for c in _probe_channels()}
+    out: list[dict] = []
+    for r in rows:
+        inst, ch = r.get("instrument", ""), r.get("channel", "")
+        out.append({
+            "netname": r.get("net", ""),
+            "role": r.get("role", "probe"),
+            "instrument": inst,
+            "channel": ch,
+            "label": labels.get((inst, ch)) or f"{inst} · {ch}".strip(" ·"),
+        })
+    return out
 
 
 def _with_probes(user_input: str) -> str:
     """Prepend the probe map (if any) to a chat turn so the LLM knows which PCB nets
     are measured (probe) vs driven (input) and on which channels. A malformed
-    setup.toml must never break a chat turn — degrade to the bare input."""
+    project.toml must never break a chat turn — degrade to the bare input."""
     try:
         rows = _probe_map()
         if not rows:
@@ -103,7 +112,7 @@ _SUN  = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox=
 _TAB_SCRIPT = """
   <script>
   (function(){
-    var tabs=['instruments','board','chat'];
+    var tabs=['instruments','board','chat','settings'];
     function show(name){
       if(tabs.indexOf(name)<0) name='instruments';
       tabs.forEach(function(t){
@@ -138,6 +147,7 @@ def _page(body: str, back: str | None = None, active_tab: str | None = None) -> 
         '<li><a href="#instruments" class="tab-link" data-tab="instruments">Instruments</a></li>'
         '<li><a href="#board" class="tab-link" data-tab="board">Board</a></li>'
         '<li><a href="#chat" class="tab-link" data-tab="chat">Chat</a></li>'
+        '<li><a href="#settings" class="tab-link" data-tab="settings">Settings</a></li>'
         '</ul>'
     ) if active_tab else ""
     body_class = "app-shell" if active_tab else ""
@@ -280,6 +290,7 @@ def index(saved: str = "") -> HTMLResponse:
         f'<section id="tab-instruments" class="tab-panel">{_instruments_panel(saved)}</section>'
         f'<section id="tab-board" class="tab-panel">{_PCB_BODY}</section>'
         f'<section id="tab-chat" class="tab-panel">{_CHAT_BODY}</section>'
+        f'<section id="tab-settings" class="tab-panel">{_settings_panel(saved)}</section>'
     )
     return _page(shell, active_tab="instruments")
 
@@ -287,10 +298,8 @@ def index(saved: str = "") -> HTMLResponse:
 def _instruments_panel(saved: str = "") -> str:
     instruments = st.load()
     setups = {s.slug: s for s in st.load_setup()}
-    netlist_path = st.get_netlist_path()
-    found_netlists = st.find_netlists()
 
-    banner = _banner("Configuration saved — Claude will pick it up automatically.") if saved else ""
+    banner = _banner("Configuration saved — Claude will pick it up automatically.") if saved == "1" else ""
 
     if not instruments:
         content = '<p>No instruments configured. <a href="/registry">Browse the registry</a> to add one.</p>'
@@ -319,35 +328,6 @@ def _instruments_panel(saved: str = "") -> str:
           <tbody>{rows}</tbody>
         </table>"""
 
-    # Netlist section
-    nl_label = f"<code>{netlist_path}</code>" if netlist_path else "<span class='muted'>not set</span>"
-    nl_datalist = ""
-    nl_list_attr = ""
-    if found_netlists:
-        opts = "".join(f'<option value="{p.name}">' for p in found_netlists)
-        nl_datalist = f'<datalist id="found-netlists">{opts}</datalist>'
-        nl_list_attr = ' list="found-netlists"'
-    clear_btn = (
-        '<button type="submit" name="netlist_path" value="" class="secondary outline">Clear</button>'
-        if netlist_path else ""
-    )
-    netlist_section = f"""
-    <details style="margin-top:2rem">
-      <summary>Simulation netlist &ensp; {nl_label}</summary>
-      <form method="post" action="/project/netlist" style="margin-top:1rem">
-        {nl_datalist}
-        <label>
-          Netlist path
-          <small class="muted">absolute path or filename in current directory</small>
-          <input name="netlist_path" value="{netlist_path or ''}" placeholder="e.g. circuit.net"{nl_list_attr}>
-        </label>
-        <div style="display:flex; gap:1rem; align-items:center">
-          <button type="submit">Save</button>
-          {clear_btn}
-        </div>
-      </form>
-    </details>"""
-
     return f"""
     {banner}
     <hgroup>
@@ -357,9 +337,112 @@ def _instruments_panel(saved: str = "") -> str:
     {content}
     <div style="display:flex;gap:.75rem;align-items:center;flex-wrap:wrap">
       <a href="/registry" role="button" class="outline">⊕ Add device</a>
-      <a href="/settings/llm" style="font-size:.875rem;color:var(--pico-muted-color)">⚙ LLM settings</a>
     </div>
-    {netlist_section}
+    """
+
+
+def _settings_panel(saved: str = "") -> str:
+    """Settings tab: how teasel is wired up — LLM, simulation, MCP bridge."""
+    banner = _banner("Settings saved.") if saved == "settings" else ""
+
+    # ── LLM backends (summary + manage link; full editor stays a drill-down) ──
+    providers = st.load_providers()
+    default = st.get_default_provider()
+    if providers:
+        items = "".join(
+            f'<li><strong>{pc.name}</strong> '
+            f'<span class="muted">{pc.type}{" · ★ default" if pc.name == default else ""}</span></li>'
+            for pc in providers.values()
+        )
+        llm_body = f"<ul style='margin:.25rem 0 .6rem'>{items}</ul>"
+    else:
+        llm_body = '<p class="muted">No backends configured yet.</p>'
+    llm_section = f"""
+    <article>
+      <h3 style="margin-top:0">LLM backends</h3>
+      <p class="muted" style="font-size:.85rem">Inference backends for <code>teasel local</code>,
+         stored in <code>~/.teasel/llm.toml</code>.</p>
+      {llm_body}
+      <a href="/settings/llm" role="button" class="outline" hx-boost="false" style="width:auto">Manage backends →</a>
+    </article>"""
+
+    # ── Simulation (netlist + SPICE backend) ──
+    netlist_path = st.get_netlist_path()
+    found_netlists = st.find_netlists()
+    nl_datalist = nl_list_attr = ""
+    if found_netlists:
+        opts = "".join(f'<option value="{p.name}">' for p in found_netlists)
+        nl_datalist = f'<datalist id="found-netlists">{opts}</datalist>'
+        nl_list_attr = ' list="found-netlists"'
+    clear_btn = (
+        '<button type="submit" name="netlist_path" value="" class="secondary outline" style="width:auto">Clear</button>'
+        if netlist_path else ""
+    )
+    ng = shutil.which("ngspice")
+    spice_status = (
+        f'<mark class="green">✓ ngspice</mark> <code style="font-size:.8em">{ng}</code>' if ng
+        else '<span style="color:var(--pico-color-amber-550)">ngspice not found on PATH</span>'
+    )
+    sim_section = f"""
+    <article>
+      <h3 style="margin-top:0">Simulation</h3>
+      <form method="post" action="/project/netlist" hx-boost="false">
+        {nl_datalist}
+        <label>SPICE netlist
+          <small class="muted">absolute path or filename in the project directory</small>
+          <input name="netlist_path" value="{netlist_path or ''}" placeholder="e.g. filter.cir"{nl_list_attr}>
+        </label>
+        <div style="display:flex; gap:1rem; align-items:center">
+          <button type="submit" style="width:auto">Save</button>
+          {clear_btn}
+        </div>
+      </form>
+      <p class="muted" style="font-size:.85rem;margin-top:.75rem">
+        SPICE backend: {spice_status}<br>
+        <small>Used by net simulation (wired up in the simulate step).</small>
+      </p>
+    </article>"""
+
+    # ── MCP integration (.mcp.json status; auto-generated, rewrite on demand) ──
+    mcp_path = Path.cwd() / ".mcp.json"
+    lab_ok = False
+    if mcp_path.exists():
+        try:
+            lab_ok = "lab" in json.loads(mcp_path.read_text()).get("mcpServers", {})
+        except Exception:
+            pass
+    n_inst = len(st.load())
+    if not mcp_path.exists():
+        mcp_status = '<span class="muted">not written yet — click Rewrite</span>'
+    elif lab_ok:
+        mcp_status = '<mark class="green">✓ lab server configured</mark>'
+    else:
+        mcp_status = '<span style="color:var(--pico-color-amber-550)">no <code>lab</code> server — click Rewrite</span>'
+    mcp_section = f"""
+    <article>
+      <h3 style="margin-top:0">MCP (Claude) integration</h3>
+      <p class="muted" style="font-size:.85rem">teasel writes <code>.mcp.json</code> so Claude Code picks up
+         your lab as an MCP server. It's regenerated automatically when instruments change; Claude reads it
+         from the project root.</p>
+      <table><tbody>
+        <tr><td class="muted">File</td><td><code style="font-size:.8em">{mcp_path}</code></td></tr>
+        <tr><td class="muted">Status</td><td>{mcp_status}
+            <span class="muted">· {n_inst} instrument{"s" if n_inst != 1 else ""}</span></td></tr>
+      </tbody></table>
+      <form method="post" action="/settings/mcp/rewrite" hx-boost="false" style="margin:0">
+        <button type="submit" class="outline" style="width:auto">Rewrite .mcp.json</button>
+      </form>
+    </article>"""
+
+    return f"""
+    {banner}
+    <hgroup>
+      <h2>Settings</h2>
+      <p class="muted">How teasel is wired up — inference, simulation, and the Claude MCP bridge.</p>
+    </hgroup>
+    {llm_section}
+    {sim_section}
+    {mcp_section}
     """
 
 
@@ -516,7 +599,7 @@ def instrument_setup_form(slug: str) -> HTMLResponse:
     body = f"""
     <hgroup>
       <h2>Setup — {slug}</h2>
-      <p>Updates <code>setup.toml</code></p>
+      <p>Updates <code>project.toml</code></p>
     </hgroup>
     <form method="post">
       {fields}
@@ -579,7 +662,14 @@ async def set_netlist(request: Request) -> RedirectResponse:
     form = await request.form()
     path = str(form.get("netlist_path", "")).strip()
     st.save_netlist_path(path or None)
-    return RedirectResponse("/?saved=1", status_code=303)
+    return RedirectResponse("/?saved=settings#settings", status_code=303)
+
+
+@app.post("/settings/mcp/rewrite")
+def mcp_rewrite() -> RedirectResponse:
+    # Regenerate .mcp.json in the project dir from the current instruments.
+    cfg.apply(st.load())
+    return RedirectResponse("/?saved=settings#settings", status_code=303)
 
 
 # ── Registry (/registry and /registry/*) ─────────────────────────────────────
@@ -731,7 +821,7 @@ def setup_form(slug: str) -> HTMLResponse:
     body = f"""
     <hgroup>
       <h2>Setup {slug}</h2>
-      <p>Step 2 of 2 — experiment settings → <code>setup.toml</code>
+      <p>Step 2 of 2 — experiment settings → <code>project.toml</code>
         <span class="muted">(optional)</span></p>
     </hgroup>
     <form method="post">
@@ -913,7 +1003,7 @@ async def ws_chat(websocket: WebSocket) -> None:
 #
 # Loads a .kicad_pcb into the patched kicanvas viewer (vendored bundle, KiCad 9
 # named-net + probe-only patch). The board renders entirely client-side — only the
-# clicked net name is POSTed to /pcb/probes and written into setup.toml, then folded
+# clicked net name is POSTed to /pcb/probes and written into project.toml, then folded
 # into the next lab-chat turn via _with_probes(). Raw string so the inline JS braces
 # survive verbatim.
 
@@ -973,7 +1063,7 @@ _PCB_BODY = r"""
   var emptyEl=document.getElementById('probe-empty');
   var nochanEl=document.getElementById('probe-nochan');
 
-  // ── probe-map state (source of truth = setup.toml via /pcb/probes) ──
+  // ── probe-map state (source of truth = project.toml via /pcb/probes) ──
   var channels=[];   // [{instrument, channel, label, default_role, ...}]
   var probes=[];     // [{netname, role, instrument, channel}]
   var chanKey=function(c){ return c.instrument+'::'+c.channel; };
@@ -1072,10 +1162,14 @@ _PCB_BODY = r"""
                  instrument:c?c.instrument:'', channel:c?c.channel:''});
     save();
   }
-  // initial load of channels + current map
-  fetch('/pcb/probes').then(function(r){return r.json();}).then(function(d){
-    channels=d.channels||[]; probes=d.probes||[]; renderTable();
-  }).catch(function(){});
+  // load channels + the current board's map (call again after a board change)
+  function loadProbes(){
+    return fetch('/pcb/probes').then(function(r){return r.json();}).then(function(d){
+      channels=d.channels||[]; probes=d.probes||[]; renderTable();
+      window.dispatchEvent(new CustomEvent('teasel:probes-changed'));
+    }).catch(function(){});
+  }
+  loadProbes();
 
   // ── kicanvas board: render, persist (IndexedDB), lazy on tab activation ──
   function deepFind(selector, root){
@@ -1129,7 +1223,7 @@ _PCB_BODY = r"""
   }
 
   // Board persists in the project: stored as a real .kicad_pcb file and referenced
-  // from setup.toml [board]. Loaded lazily on first Board-tab activation so the
+  // from project.toml [board]. Loaded lazily on first Board-tab activation so the
   // WebGL canvas isn't sized while hidden.
   var savedBoard=null, rendered=false, boardActive=false;
   function maybeRender(){
@@ -1153,11 +1247,13 @@ _PCB_BODY = r"""
     fetch('/pcb/board',{method:'POST',headers:{'Content-Type':'application/json'},
       body:JSON.stringify(savedBoard)})
       .then(function(r){return r.json();})
-      .then(function(d){ if(d && d.name){ savedBoard.name=d.name; nameEl.textContent=d.name; } })
+      .then(function(d){ if(d && d.name){ savedBoard.name=d.name; nameEl.textContent=d.name; }
+        // board changed → load that board's probe map (empty if new, restored if seen)
+        return loadProbes(); })
       .catch(function(){});
   });
   clearBoardBtn.addEventListener('click', function(){
-    fetch('/pcb/board/clear',{method:'POST'}).catch(function(){});
+    fetch('/pcb/board/clear',{method:'POST'}).then(function(){ return loadProbes(); }).catch(function(){});
     savedBoard=null; rendered=false; installedOn=null;
     placeholder(); nameEl.textContent=''; clearBoardBtn.style.display='none';
   });
@@ -1179,25 +1275,20 @@ def get_probes() -> dict:
 
 @app.post("/pcb/probes")
 async def set_probes(request: Request) -> dict:
-    """Replace the whole probe map. Body is a list of {netname, role, instrument,
-    channel}. We clear net/role from every channel, then write the posted rows into
-    setup.toml — preserving each channel's label/probe (one net ↔ one channel)."""
+    """Replace the probe map for the currently-loaded board. Body is a list of
+    {netname, role, instrument, channel}; written to project.toml under that board."""
     payload = await request.json()
     rows = payload if isinstance(payload, list) else payload.get("probes", [])
 
-    setups = st.load_setup()
-    by_slug = {s.slug: s for s in setups}
+    board = st.load_board_file()
+    if not board:
+        return {"ok": False, "probes": []}
+
     # Only accept (instrument, channel) pairs that are real channels on connected
-    # instruments. This enforces "strictly from instruments" server-side and keeps
-    # untrusted client values out of TOML section keys (corruption guard).
+    # instruments — enforces "strictly from instruments" and keeps untrusted client
+    # values out of the stored map. One net ↔ one channel; role clamped.
     valid = {(c["instrument"], c["channel"]) for c in _probe_channels()}
-
-    # clear existing assignments (keep label/probe)
-    for s in setups:
-        for cfg in s.channels.values():
-            cfg.pop("net", None)
-            cfg.pop("role", None)
-
+    clean: list[dict] = []
     seen: set[str] = set()
     for row in rows:
         net = (row.get("netname") or "").strip()
@@ -1207,33 +1298,21 @@ async def set_probes(request: Request) -> dict:
         if not net or net in seen or (inst, ch) not in valid:
             continue
         seen.add(net)
-        s = by_slug.get(inst)
-        if s is None:
-            s = st.InstrumentSetup(slug=inst)
-            by_slug[inst] = s
-            setups.append(s)
-        cfg = dict(s.channels.get(ch, {}))
-        cfg["net"] = net
-        cfg["role"] = role
-        s.channels[ch] = cfg
+        clean.append({"net": net, "instrument": inst, "channel": ch, "role": role})
 
-    # drop channel blocks left empty after clearing
-    for s in setups:
-        s.channels = {k: v for k, v in s.channels.items() if v}
-
-    st.save_setup(setups)
+    st.save_probes(board, clean)
     return {"ok": True, "probes": _probe_map()}
 
 
-# ── PCB board file (stored in the project, referenced from setup.toml [board]) ──
+# ── PCB board file (stored in the project, referenced from project.toml [board]) ──
 
 @app.get("/pcb/board")
 def get_board() -> dict:
-    """Return the project board (filename + content) referenced by setup.toml, if any."""
+    """Return the project board (filename + content) referenced by project.toml, if any."""
     name = st.load_board_file()
     if not name:
         return {"name": None}
-    # Defend against a hand-edited setup.toml with a traversal path — only serve a
+    # Defend against a hand-edited project.toml with a traversal path — only serve a
     # plain .kicad_pcb from the project dir.
     name = Path(name).name
     if not name.endswith(".kicad_pcb"):
@@ -1250,7 +1329,7 @@ def get_board() -> dict:
 @app.post("/pcb/board")
 async def set_board(request: Request) -> dict:
     """Persist an uploaded board: write it as a real .kicad_pcb in the project dir and
-    record [board].file in setup.toml. Board content stays out of teasel.toml/setup.toml."""
+    record [board].file in project.toml. Board content stays out of teasel.toml/project.toml."""
     data = await request.json()
     name = Path((data.get("name") or "").strip()).name  # strip any path components
     content = data.get("content") or ""
@@ -1389,38 +1468,27 @@ def _save_setup(inst: st.InstrumentConfig, form) -> None:
             except ValueError:
                 pass
 
-    # Merge into the prior setup so net/role (owned by the /pcb probe map) survive
-    # this label/probe rewrite.
-    setups = st.load_setup()
-    prior = next((s for s in setups if s.slug == inst.slug), None)
-    prior_channels = prior.channels if prior else {}
-
-    def merged(ch: str, **fields: str) -> dict:
-        cfg = dict(prior_channels.get(ch, {}))
-        for k, v in fields.items():
-            if v:
-                cfg[k] = v
-            else:
-                cfg.pop(k, None)
-        return cfg
-
+    # Channels hold only bench tuning (label/probe). Net/role live in the per-board
+    # probe map (project.toml [boards.*]), so there's nothing to merge here.
     channels: dict[str, dict] = {}
     if inst.type == "function-generator":
         for ch in ("output", "ttl"):
-            cfg = merged(ch, label=str(form.get(f"ch_{ch}_label", "")).strip())
-            if cfg:
-                channels[ch] = cfg
+            lbl = str(form.get(f"ch_{ch}_label", "")).strip()
+            if lbl:
+                channels[ch] = {"label": lbl}
     else:
         for ch in ("C1", "C2", "C3", "C4"):
-            cfg = merged(
-                ch,
-                probe=str(form.get(f"ch_{ch}_probe", "")).strip(),
-                label=str(form.get(f"ch_{ch}_label", "")).strip(),
-            )
+            cfg: dict = {}
+            probe = str(form.get(f"ch_{ch}_probe", "")).strip()
+            lbl = str(form.get(f"ch_{ch}_label", "")).strip()
+            if probe:
+                cfg["probe"] = probe
+            if lbl:
+                cfg["label"] = lbl
             if cfg:
                 channels[ch] = cfg
 
-    existing = [s for s in setups if s.slug != inst.slug]
+    existing = [s for s in st.load_setup() if s.slug != inst.slug]
     existing.append(st.InstrumentSetup(slug=inst.slug, limits=limits, channels=channels))
     st.save_setup(existing)
 
@@ -1559,7 +1627,7 @@ def llm_settings(saved: str = "", edit: str = "") -> HTMLResponse:
     }}
     </script>
     """
-    return _page(body, back="/")
+    return _page(body, back="/#settings")
 
 
 @app.post("/settings/llm/save")

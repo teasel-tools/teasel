@@ -4,8 +4,10 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
+import tomli_w
+
 TEASEL_TOML = "teasel.toml"
-SETUP_TOML = "setup.toml"
+PROJECT_TOML = "project.toml"
 TEASEL_LOG = "teasel.log"
 LLM_CONFIG_PATH = Path.home() / ".teasel" / "llm.toml"
 
@@ -53,7 +55,32 @@ def _toml_path(filename: str, directory: Path | None) -> Path:
     return (directory or Path.cwd()) / filename
 
 
-# ── Netlist (project section of teasel.toml) ──────────────────────────────────
+# ── project.toml (the experiment / DUT: board, netlist, per-board probe maps,
+#    and per-instrument channel/limit tuning) ─────────────────────────────────
+#
+# Read with tomllib, written with tomli_w. Every setter loads the whole doc,
+# mutates one section, and writes it back so the rest is preserved.
+
+def _load_project(directory: Path | None = None) -> dict:
+    path = _toml_path(PROJECT_TOML, directory)
+    if not path.exists():
+        return {}
+    try:
+        return tomllib.loads(path.read_text())
+    except Exception:
+        return {}
+
+
+def _write_project(doc: dict, directory: Path | None = None) -> None:
+    directory = directory or Path.cwd()
+    path = _toml_path(PROJECT_TOML, directory)
+    old_text = path.read_text() if path.exists() else ""
+    new_text = "# project.toml — experiment / device under test\n\n" + tomli_w.dumps(doc)
+    path.write_text(new_text)
+    _append_log(old_text, new_text, directory / TEASEL_LOG, "project")
+
+
+# ── Netlist (project.toml [netlist].path) ─────────────────────────────────────
 
 def set_session_netlist(path: str) -> None:
     global _session_netlist
@@ -61,26 +88,23 @@ def set_session_netlist(path: str) -> None:
 
 
 def get_netlist_path(directory: Path | None = None) -> str | None:
-    """Return the active netlist path: session override > teasel.toml > None."""
+    """Return the active netlist path: session override > project.toml > None."""
     if _session_netlist is not None:
         return _session_netlist
     return load_netlist_path(directory)
 
 
 def load_netlist_path(directory: Path | None = None) -> str | None:
-    path = _toml_path(TEASEL_TOML, directory)
-    if not path.exists():
-        return None
-    doc = tomllib.loads(path.read_text())
-    return doc.get("project", {}).get("netlist")
+    return _load_project(directory).get("netlist", {}).get("path") or None
 
 
 def save_netlist_path(netlist: str | None, directory: Path | None = None) -> None:
-    directory = directory or Path.cwd()
-    path = _toml_path(TEASEL_TOML, directory)
-    path.write_text(_serialize(
-        load(directory), netlist=netlist, llm_provider=load_project_provider(directory)
-    ))
+    doc = _load_project(directory)
+    if netlist:
+        doc["netlist"] = {"path": netlist}
+    else:
+        doc.pop("netlist", None)
+    _write_project(doc, directory)
 
 
 # ── Project LLM provider reference (teasel.toml [llm]) ─────────────────────────
@@ -97,9 +121,7 @@ def load_project_provider(directory: Path | None = None) -> str | None:
 def save_project_provider(provider: str | None, directory: Path | None = None) -> None:
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
-    path.write_text(_serialize(
-        load(directory), netlist=load_netlist_path(directory), llm_provider=provider
-    ))
+    path.write_text(_serialize(load(directory), llm_provider=provider))
 
 
 def find_netlists(directory: Path | None = None) -> list[Path]:
@@ -170,25 +192,16 @@ def save(instruments: list[InstrumentConfig], directory: Path | None = None) -> 
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
     old_text = path.read_text() if path.exists() else ""
-    new_text = _serialize(
-        instruments,
-        netlist=load_netlist_path(directory),
-        llm_provider=load_project_provider(directory),
-    )
+    new_text = _serialize(instruments, llm_provider=load_project_provider(directory))
     path.write_text(new_text)
     _append_log(old_text, new_text, directory / TEASEL_LOG, "instruments")
 
 
 def _serialize(
     instruments: list[InstrumentConfig],
-    netlist: str | None = None,
     llm_provider: str | None = None,
 ) -> str:
     lines = ["# teasel.toml — lab instruments and connections", ""]
-    if netlist is not None:
-        lines.append("[project]")
-        lines.append(f'netlist = "{_escape(netlist)}"')
-        lines.append("")
     if llm_provider:
         lines.append("[llm]")
         lines.append(f'provider = "{_escape(llm_provider)}"')
@@ -207,13 +220,10 @@ def _serialize(
     return "\n".join(lines)
 
 
-# ── Experiment setup (setup.toml) ─────────────────────────────────────────────
+# ── Per-instrument channel/limit tuning (project.toml [instruments.*]) ─────────
 
 def load_setup(directory: Path | None = None) -> list[InstrumentSetup]:
-    path = _toml_path(SETUP_TOML, directory)
-    if not path.exists():
-        return []
-    doc = tomllib.loads(path.read_text())
+    doc = _load_project(directory)
     return [
         InstrumentSetup(
             slug=slug,
@@ -224,57 +234,79 @@ def load_setup(directory: Path | None = None) -> list[InstrumentSetup]:
     ]
 
 
-# Sentinel so save_setup() preserves the existing [board] ref unless told otherwise.
-_KEEP = object()
+def save_setup(setups: list[InstrumentSetup], directory: Path | None = None) -> None:
+    doc = _load_project(directory)
+    insts: dict[str, dict] = {}
+    for s in setups:
+        entry: dict = {}
+        if s.limits:
+            entry["limits"] = {k: float(v) for k, v in s.limits.items()}
+        chans = {ch: dict(cfg) for ch, cfg in s.channels.items() if cfg}
+        if chans:
+            entry["channels"] = chans
+        if entry:
+            insts[s.slug] = entry
+    if insts:
+        doc["instruments"] = insts
+    else:
+        doc.pop("instruments", None)
+    _write_project(doc, directory)
 
 
-def save_setup(
-    setups: list[InstrumentSetup],
-    directory: Path | None = None,
-    board_file: object = _KEEP,
-) -> None:
-    directory = directory or Path.cwd()
-    path = _toml_path(SETUP_TOML, directory)
-    old_text = path.read_text() if path.exists() else ""
-    if board_file is _KEEP:
-        board_file = load_board_file(directory)
-    new_text = _serialize_setup(setups, board_file)
-    path.write_text(new_text)
-    _append_log(old_text, new_text, directory / TEASEL_LOG, "setup")
-
+# ── Loaded board (project.toml [board].file) ──────────────────────────────────
 
 def load_board_file(directory: Path | None = None) -> str | None:
-    """Return the project board filename recorded in setup.toml [board].file, or None."""
-    path = _toml_path(SETUP_TOML, directory)
-    if not path.exists():
-        return None
-    doc = tomllib.loads(path.read_text())
-    return doc.get("board", {}).get("file") or None
+    """Return the currently-loaded board filename, or None."""
+    return _load_project(directory).get("board", {}).get("file") or None
 
 
 def save_board_file(filename: str | None, directory: Path | None = None) -> None:
-    """Set (or clear, if None) the [board].file reference, preserving everything else."""
-    save_setup(load_setup(directory), directory, board_file=filename)
+    """Set (or clear, if None) the loaded board, preserving everything else."""
+    doc = _load_project(directory)
+    if filename:
+        doc["board"] = {"file": filename}
+    else:
+        doc.pop("board", None)
+    _write_project(doc, directory)
 
 
-def _serialize_setup(setups: list[InstrumentSetup], board_file: str | None = None) -> str:
-    lines = ["# setup.toml — experiment configuration (probes, limits, labels, board)", ""]
-    if board_file:
-        lines.append("[board]")
-        lines.append(f'file = "{_escape(board_file)}"')
-        lines.append("")
-    for s in setups:
-        if s.limits:
-            lines.append(f"[instruments.{s.slug}.limits]")
-            for k, v in s.limits.items():
-                lines.append(f"{k} = {v}")
-            lines.append("")
-        for ch, cfg in s.channels.items():
-            lines.append(f"[instruments.{s.slug}.channels.{ch}]")
-            for k, v in cfg.items():
-                lines.append(_toml_value(k, str(v)))
-            lines.append("")
-    return "\n".join(lines)
+# ── Per-board probe maps (project.toml [boards."<file>".probes]) ───────────────
+#
+# The net→channel/role map is a property of the board (DUT), so it's keyed by
+# board filename. Switching boards swaps to that board's map; each is remembered.
+
+def load_probes(board: str | None, directory: Path | None = None) -> list[dict]:
+    if not board:
+        return []
+    boards = _load_project(directory).get("boards", {})
+    return [dict(p) for p in boards.get(board, {}).get("probes", [])]
+
+
+def save_probes(board: str | None, rows: list[dict], directory: Path | None = None) -> None:
+    if not board:
+        return
+    doc = _load_project(directory)
+    boards = doc.setdefault("boards", {})
+    clean = [
+        {
+            "net": r["net"],
+            "instrument": r["instrument"],
+            "channel": r.get("channel", ""),
+            "role": "input" if r.get("role") == "input" else "probe",
+        }
+        for r in rows
+        if r.get("net") and r.get("instrument")
+    ]
+    if clean:
+        boards.setdefault(board, {})["probes"] = clean
+    else:
+        if board in boards:
+            boards[board].pop("probes", None)
+            if not boards[board]:
+                boards.pop(board)
+    if not boards:
+        doc.pop("boards", None)
+    _write_project(doc, directory)
 
 
 # ── LLM provider bundles (~/.teasel/llm.toml) ─────────────────────────────────
