@@ -3,7 +3,7 @@
 `kicanvas.js` is built from the teasel fork of kicanvas, **not** edited here.
 
 - Source: https://github.com/teasel-tools/kicanvas (branch `teasel`)
-- Built from commit: `ff90146` + uncommitted teasel-theme recolor (update hash on fork commit)
+- Built from commit: `f0886f4` (teasel-theme recolor)
 - Rebuild: `git -C ../kicanvas checkout teasel && npm run build:no-check` → `build/kicanvas.js`
 - Patches (on `teasel` branch):
   - KiCad 9 named-only net support + probe-only (pads/tracks/vias) selection.
