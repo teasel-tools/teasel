@@ -487,6 +487,11 @@ def main():
     mcp.settings.host = args.host
     mcp.settings.port = args.port
     mcp.add_tool(_get_setup, name="get_setup")
+
+    # House-styled plotting (cross-cutting: any trace, any source).
+    from .plotting import register_plot_tools
+    register_plot_tools(mcp, lambda: _state.drivers)
+
     if args.transport == "streamable-http":
         print(f"Listening on {args.host}:{args.port}")
     try:

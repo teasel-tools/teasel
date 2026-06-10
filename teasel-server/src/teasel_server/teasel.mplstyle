@@ -1,0 +1,56 @@
+# teasel house plot style — slate + jade, matching the teasel web UI.
+#
+# This is the single source of visual truth for every figure teasel produces:
+# the `plot` MCP tool applies it, and free-handed matplotlib should too via
+#   plt.style.use(<path from the get_plot_style tool>)
+# Your editable copy lives at ~/.teasel/teasel.mplstyle (seeded from this file
+# on first use); edit that copy to restyle every plot at once.
+
+figure.facecolor: 0e1118
+figure.figsize: 8.0, 4.5
+figure.dpi: 110
+figure.autolayout: True
+
+savefig.dpi: 180
+savefig.facecolor: 0e1118
+savefig.bbox: tight
+
+axes.facecolor: 141a26
+axes.edgecolor: 333c4e
+axes.linewidth: 0.8
+axes.labelcolor: eef1f4
+axes.titlecolor: eef1f4
+axes.titlesize: 13
+axes.titleweight: bold
+axes.titlepad: 12
+axes.labelsize: 11
+axes.grid: True
+axes.axisbelow: True
+# jade first, then a restrained engineering palette
+axes.prop_cycle: cycler('color', ['03b07a', '4ea1ff', 'f2c14e', 'e36588', '9aa4b2', 'b48ef0'])
+
+grid.color: 2b3445
+grid.linewidth: 0.6
+grid.alpha: 0.8
+
+lines.linewidth: 1.8
+lines.solid_capstyle: round
+
+xtick.color: aeb7c4
+ytick.color: aeb7c4
+xtick.labelsize: 9.5
+ytick.labelsize: 9.5
+
+legend.frameon: True
+legend.facecolor: 1a212c
+legend.edgecolor: 2b3445
+legend.framealpha: 0.92
+legend.fontsize: 9.5
+legend.labelcolor: eef1f4
+
+text.color: eef1f4
+font.family: sans-serif
+font.size: 10.5
+
+# keep text as text in SVG so it stays crisp and selectable in the web UI
+svg.fonttype: none

@@ -2,13 +2,14 @@
 
 import asyncio
 import json
+import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
@@ -27,6 +28,22 @@ app = FastAPI(title="teasel", version=get_version())
 
 _STATIC_DIR = Path(__file__).parent / "static"
 app.mount("/static", StaticFiles(directory=_STATIC_DIR), name="static")
+
+# teasel-server writes waveform CSVs, screenshots, and plots here (same default
+# the server uses); serving it lets the chat inline generated plots/screenshots.
+_OUTPUT_DIR = Path(os.environ.get("TEASEL_OUTPUT_DIR", "./teasel-output"))
+
+_ARTIFACT_NAME = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]*")
+
+
+@app.get("/artifacts/{name}")
+def artifact(name: str) -> FileResponse:
+    if not _ARTIFACT_NAME.fullmatch(name) or ".." in name:
+        return HTMLResponse("bad name", status_code=400)
+    path = (_OUTPUT_DIR / name).resolve()
+    if path.parent != _OUTPUT_DIR.resolve() or not path.exists():
+        return HTMLResponse("not found", status_code=404)
+    return FileResponse(path)
 
 # Probe map — which PCB nets are wired to which instrument channels. Not ephemeral:
 # it's stored per-board in project.toml ([boards."<file>".probes]), so switching
@@ -880,6 +897,8 @@ _CHAT_BODY = r"""
   #chat-log .guardrail{align-self:flex-start;font-size:.75rem;color:var(--pico-color-amber-550)}
   #chat-log .error{align-self:flex-start;font-size:.82rem;color:var(--pico-color-red-550)}
   #chat-log .empty{margin:auto;color:var(--pico-muted-color);font-size:.85rem;text-align:center}
+  #chat-log .artifact{align-self:flex-start;max-width:92%}
+  #chat-log .artifact img{display:block;max-width:100%;border-radius:10px;border:1px solid var(--pico-table-border-color)}
 </style>
 <div id="chat-log"><div class="empty">Ask teasel to read or drive a connected instrument.</div></div>
 <form id="chat-form" autocomplete="off" hx-boost="false">
@@ -914,6 +933,18 @@ _CHAT_BODY = r"""
     log.appendChild(d); log.scrollTop=log.scrollHeight; return d;
   }
   function busy(b){ input.disabled=b; send.disabled=b; if(!b){input.focus();} }
+  // Tool results that saved a plot or screenshot get the image inlined.
+  function addArtifacts(text){
+    var re=/\b(plot_[A-Za-z0-9_]+\.svg|screenshot_[A-Za-z0-9._-]+\.png)\b/g, m, seen={};
+    while((m=re.exec(text||''))!==null){
+      if(seen[m[1]]){continue;} seen[m[1]]=true;
+      var d=document.createElement('div'); d.className='artifact';
+      var img=document.createElement('img'); img.src='/artifacts/'+m[1]; img.alt=m[1];
+      img.onload=function(){ log.scrollTop=log.scrollHeight; };
+      img.onerror=function(){ d.remove(); };
+      d.appendChild(img); log.appendChild(d); log.scrollTop=log.scrollHeight;
+    }
+  }
   var proto=location.protocol==='https:'?'wss:':'ws:';
   var ws=new WebSocket(proto+'//'+location.host+'/ws/chat?brain=local');
   ws.onclose=function(){ busy(true); statusEl.textContent='disconnected — reload to reconnect'; };
@@ -923,7 +954,7 @@ _CHAT_BODY = r"""
     if(m.type==='ready'){ statusEl.textContent=m.provider+' · '+m.model+' · '+m.tools+' tools'; busy(false); }
     else if(m.type==='text'){ add('msg assistant', m.text); }
     else if(m.type==='tool_call'){ m.calls.forEach(function(c){ add('trace','→ '+c.name+'('+JSON.stringify(c.args)+')'); }); }
-    else if(m.type==='tool_result'){ add('trace','← '+(m.text||'').split('\n')[0].slice(0,200)); }
+    else if(m.type==='tool_result'){ add('trace','← '+(m.text||'').split('\n')[0].slice(0,200)); addArtifacts(m.text); }
     else if(m.type==='guardrail'){ add('guardrail','⚠ '+m.label+': '+(m.text||'').split('\n')[0].slice(0,200)); }
     else if(m.type==='error'){ add('error', m.text); busy(false); }
     else if(m.type==='done'){ busy(false); }

@@ -18,6 +18,7 @@ dependencies = [
     "psutil>=5.9.0",
     "pyserial>=3.5",
     "spicelib>=1.6.1",
+    "matplotlib>=3.8",
 ]
 
 [project.scripts]
