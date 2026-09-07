@@ -1,10 +1,9 @@
-# teasel house plot style — slate + jade, matching the teasel web UI.
-#
-# This is the single source of visual truth for every figure teasel produces:
-# the `plot` MCP tool applies it, and free-handed matplotlib should too via
-#   plt.style.use(<path from the get_plot_style tool>)
-# Your editable copy lives at ~/.teasel/teasel.mplstyle (seeded from this file
-# on first use); edit that copy to restyle every plot at once.
+# teasel "dark" plot style — slate + jade, matching the teasel web UI.
+# This is the default style. Styles are named .mplstyle files; a project can
+# select another with [plot] style = "<name>" in its project.toml, or ship its
+# own .mplstyle and reference it by path. Your editable copies live in
+# ~/.teasel/styles/ (seeded from the bundled styles on first use); edits there
+# take effect on the next plot — no restart.
 
 figure.facecolor: 0e1118
 figure.figsize: 8.0, 4.5

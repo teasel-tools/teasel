@@ -1,0 +1,58 @@
+# teasel "datasheet" plot style — light, printer-friendly.
+# White background, dark ink, inward ticks and a graph-paper grid for a classic
+# instrument-datasheet look. Select per project with [plot] style = "datasheet"
+# in project.toml. Edit your copy at ~/.teasel/styles/datasheet.mplstyle to tweak.
+
+figure.facecolor: white
+figure.figsize: 8.0, 4.5
+figure.dpi: 110
+figure.autolayout: True
+
+savefig.dpi: 200
+savefig.facecolor: white
+savefig.bbox: tight
+
+axes.facecolor: white
+axes.edgecolor: 1a1a1a
+axes.linewidth: 1.0
+axes.labelcolor: 1a1a1a
+axes.titlecolor: 1a1a1a
+axes.titlesize: 13
+axes.titleweight: bold
+axes.titlepad: 10
+axes.labelsize: 11
+axes.grid: True
+axes.axisbelow: True
+# print-legible engineering palette (distinct in color and when photocopied)
+axes.prop_cycle: cycler('color', ['0b7a5e', '1f6feb', 'd9822b', 'c0392b', '6b4ca8', '4a5568'])
+
+grid.color: c9c9c9
+grid.linewidth: 0.6
+grid.alpha: 1.0
+
+lines.linewidth: 1.6
+lines.solid_capstyle: round
+
+# inward ticks + visible minor tick marks read as a datasheet / lab plot
+xtick.direction: in
+ytick.direction: in
+xtick.minor.visible: True
+ytick.minor.visible: True
+xtick.color: 1a1a1a
+ytick.color: 1a1a1a
+xtick.labelsize: 9.5
+ytick.labelsize: 9.5
+
+legend.frameon: True
+legend.facecolor: white
+legend.edgecolor: 999999
+legend.framealpha: 0.95
+legend.fontsize: 9.5
+legend.labelcolor: 1a1a1a
+
+text.color: 1a1a1a
+font.family: sans-serif
+font.size: 10.5
+
+# keep text as text in SVG so it stays crisp and selectable in the web UI
+svg.fonttype: none
