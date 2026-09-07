@@ -1,0 +1,13 @@
+[instrument]
+slug = "dummy-scope"
+name = "Dummy Oscilloscope"
+manufacturer = "teasel"
+type = "oscilloscope"
+interfaces = []
+
+[[mcp.packages]]
+package = "teasel-server"
+distribution = "pypi"
+install = "uvx teasel-server"
+command = "uvx teasel-server"
+description = "Bundled in teasel-server"

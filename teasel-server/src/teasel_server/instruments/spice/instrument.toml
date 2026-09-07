@@ -1,0 +1,27 @@
+[instrument]
+slug = "spice"
+name = "SPICE Simulator (ngspice)"
+manufacturer = "ngspice"
+type = "other"
+interfaces = []
+
+[setup]
+steps = [
+  { text = "Place your SPICE netlist (.cir) in the project directory." },
+  { text = "Requires ngspice on PATH (e.g. `apt install ngspice` or `brew install ngspice`)." },
+]
+
+[[mcp.packages]]
+package = "teasel-server"
+distribution = "pypi"
+install = "uvx teasel-server"
+command = "uvx teasel-server"
+description = "Bundled in teasel-server"
+
+[[mcp.config.params]]
+key = "PROJECT_DIR"
+description = "Directory holding the SPICE netlist (defaults to the current directory)"
+example = "."
+required = false
+default = "."
+type = "string"

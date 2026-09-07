@@ -1,0 +1,36 @@
+[instrument]
+slug = "lecroy-wavesurfer"
+name = "LeCroy WaveSurfer"
+manufacturer = "LeCroy"
+type = "oscilloscope"
+interfaces = ["ethernet", "usb"]
+
+[interface.ethernet]
+protocol = "vicp"
+
+[setup]
+steps = [
+  { text = "Connect the scope to your network (or directly to your computer) over Ethernet, or via USB." },
+  { text = "Find the scope's IP address (Utilities -> Remote on the front panel)." },
+]
+
+[[mcp.packages]]
+package = "teasel-server"
+distribution = "pypi"
+install = "uvx teasel-server"
+command = "uvx teasel-server"
+description = "Bundled in teasel-server"
+
+[[mcp.config.params]]
+key = "LECROY_HOST"
+description = "IP address or hostname of the scope (Ethernet). Either this or LECROY_RESOURCE is required."
+example = "192.168.1.50"
+required = false
+type = "string"
+
+[[mcp.config.params]]
+key = "LECROY_RESOURCE"
+description = "Full VISA resource string (overrides LECROY_HOST). Use for USB or non-default Ethernet addressing."
+example = "TCPIP0::192.168.1.50::inst0::INSTR"
+required = false
+type = "string"

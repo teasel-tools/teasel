@@ -1,0 +1,50 @@
+[instrument]
+slug = "pm5190"
+name = "Philips PM5190"
+manufacturer = "Philips"
+type = "function-generator"
+year = 1985
+interfaces = ["gpib"]
+manual = "https://www.manualslib.com/manual/3581428/Philips-Pm5190.html"
+
+[interface.gpib]
+default_address = 4
+address_range = [0, 30]
+adapter = "prologix-compatible"
+
+[setup]
+steps = [
+  { text = "Set the GPIB address using the DIP switches on the bottom of the unit." },
+  { text = "Connect the Prologix-compatible adapter to the instrument's GPIB port and to a USB port on your computer." },
+  { text = "Note the serial port assigned to the adapter (e.g. /dev/ttyUSB0 on Linux, COM3 on Windows)." },
+]
+
+[[mcp.packages]]
+package = "teasel-server"
+distribution = "pypi"
+install = "uvx teasel-server"
+command = "uvx teasel-server"
+description = "Bundled in teasel-server"
+
+[[mcp.config.params]]
+key = "PM5190_PORT"
+description = "Serial port the GPIB adapter is connected to"
+example = "/dev/ttyUSB0"
+required = true
+type = "string"
+
+[[mcp.config.params]]
+key = "PM5190_ADDR"
+description = "GPIB address (0-30), set via DIP switches on the bottom of the unit"
+example = "4"
+required = false
+default = "4"
+type = "integer"
+
+[[mcp.config.params]]
+key = "PM5190_BAUD"
+description = "Baud rate of the serial adapter (usually 115200)"
+example = "115200"
+required = false
+default = "115200"
+type = "integer"
