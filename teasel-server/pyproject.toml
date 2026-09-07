@@ -4,12 +4,12 @@ build-backend = "hatchling.build"
 
 [project]
 name = "teasel-server"
-version = "0.1.9"
+version = "0.1.10"
 description = "Unified MCP server for lab instruments"
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
-    "mcp[cli]>=1.27.0",
+    "mcp[cli]>=1.27.0,<2",
     "httpx>=0.27",
     "pyvisa>=1.13.0",
     "pyvisa-py>=0.7.0",
@@ -26,6 +26,7 @@ teasel-server = "teasel_server.server:main"
 
 [project.entry-points."teasel.instruments"]
 lecroy-wavesurfer = "teasel_server.instruments.lecroy_wavesurfer.driver:LecroyWaveSurferDriver"
+hmo724 = "teasel_server.instruments.HMO724.driver:HMO724Driver"
 pm5190 = "teasel_server.instruments.pm5190.driver:PM5190Driver"
 dummy-fg = "teasel_server.instruments.dummy.driver:DummyFunctionGenerator"
 dummy-scope = "teasel_server.instruments.dummy.driver:DummyOscilloscope"

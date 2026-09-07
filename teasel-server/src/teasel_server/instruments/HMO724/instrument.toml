@@ -1,0 +1,40 @@
+[instrument]
+slug = "hmo724"
+name = "Hameg HMO724"
+manufacturer = "Hameg"
+type = "oscilloscope"
+year = 2010
+interfaces = ["usb"]
+manual = "https://www.rohde-schwarz.com/manual/hmo-compact/"
+
+[interface.usb]
+protocol = "scpi-serial"
+default_address = "/dev/ttyUSB0"
+
+[setup]
+steps = [
+  { text = "Connect the scope to your computer with the HO720 USB cable (it appears as a serial port via its FTDI adapter)." },
+  { text = "Note the serial port assigned to it (e.g. /dev/ttyUSB0 on Linux, COM3 on Windows)." },
+]
+
+[[mcp.packages]]
+package = "teasel-server"
+distribution = "pypi"
+install = "uvx teasel-server"
+command = "uvx teasel-server"
+description = "Bundled in teasel-server"
+
+[[mcp.config.params]]
+key = "HMO724_PORT"
+description = "Serial port the scope is connected to"
+example = "/dev/ttyUSB0"
+required = true
+type = "string"
+
+[[mcp.config.params]]
+key = "HMO724_BAUD"
+description = "Baud rate of the serial connection (usually 115200)"
+example = "115200"
+required = false
+default = "115200"
+type = "integer"
