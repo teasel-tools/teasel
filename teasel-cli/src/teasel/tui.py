@@ -11,6 +11,7 @@ from textual.widgets import Button, DataTable, Footer, Header, Input, Label, Lis
 
 from . import config as cfg
 from . import state as st
+from .launcher import LaunchChoice
 from .registry import DriverDescriptor, fetch_driver, fetch_index
 
 _ADD_ROW_KEY = "__add__"
@@ -23,6 +24,7 @@ class _Input(Input):
 
 class ConnectedScreen(Screen):
     BINDINGS = [
+        Binding("escape", "app.pop_screen", "Back"),
         Binding("q", "quit", "Quit"),
         Binding("s", "all_setup", "All setup"),
         Binding("c", "connection", "Connection"),
@@ -188,20 +190,14 @@ class SetupScreen(Screen):
                                 suggester=suggester,
                             )
                             yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
-                    yield Label("Amplitude limit (Vpp)")
-                    yield _Input(
-                        value=str(current.limits.get("amplitude_max", "")),
-                        placeholder="no limit",
-                        id=f"limit-{inst.slug}-amplitude_max",
-                        classes="param-input",
-                    )
-                    yield Label("Frequency limit (Hz)")
-                    yield _Input(
-                        value=str(current.limits.get("frequency_max", "")),
-                        placeholder="no limit",
-                        id=f"limit-{inst.slug}-frequency_max",
-                        classes="param-input",
-                    )
+                    for key, label, kind in st.LIMIT_FIELDS:
+                        yield Label(label)
+                        yield _Input(
+                            value=str(current.limits.get(key, "")),
+                            placeholder="no limit" if kind == "number" else "why these limits exist",
+                            id=f"limit-{inst.slug}-{key}",
+                            classes="param-input",
+                        )
                 if inst.type in ("oscilloscope",):
                     for ch in ("C1", "C2", "C3", "C4"):
                         ch_cfg = current.channels.get(ch, {})
@@ -241,21 +237,19 @@ class SetupScreen(Screen):
     def _save(self) -> None:
         setups: list[st.InstrumentSetup] = []
         for inst in self.instruments:
-            limits: dict[str, float] = {}
+            limits: dict = {}
             channels: dict[str, dict] = {}
             if inst.type == "function-generator":
                 for ch in ("output", "ttl"):
                     lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
                     if lbl:
                         channels[ch] = {"label": lbl}
-                for key in ("amplitude_max", "frequency_max"):
-                    widget = self.query_one(f"#limit-{inst.slug}-{key}", Input)
-                    val = widget.value.strip()
-                    if val:
-                        try:
-                            limits[key] = float(val)
-                        except ValueError:
-                            pass
+                previous = next((s.limits for s in st.load_setup() if s.slug == inst.slug), {})
+                limits = st.limits_from_form(
+                    {key: self.query_one(f"#limit-{inst.slug}-{key}", Input).value
+                     for key, _, _ in st.LIMIT_FIELDS},
+                    previous,
+                )
             if inst.type == "oscilloscope":
                 for ch in ("C1", "C2", "C3", "C4"):
                     probe = self.query_one(f"#ch-{inst.slug}-{ch}-probe", Input).value.strip()
@@ -548,20 +542,14 @@ class InstrumentSetupScreen(Screen):
                             suggester=suggester,
                         )
                         yield Button("×", id=f"clear-{inst.slug}-{ch}", classes="clear-btn")
-                yield Label("Amplitude limit (Vpp)")
-                yield _Input(
-                    value=str(current.limits.get("amplitude_max", "")),
-                    placeholder="no limit",
-                    id=f"limit-{inst.slug}-amplitude_max",
-                    classes="param-input",
-                )
-                yield Label("Frequency limit (Hz)")
-                yield _Input(
-                    value=str(current.limits.get("frequency_max", "")),
-                    placeholder="no limit",
-                    id=f"limit-{inst.slug}-frequency_max",
-                    classes="param-input",
-                )
+                for key, label, kind in st.LIMIT_FIELDS:
+                    yield Label(label)
+                    yield _Input(
+                        value=str(current.limits.get(key, "")),
+                        placeholder="no limit" if kind == "number" else "why these limits exist",
+                        id=f"limit-{inst.slug}-{key}",
+                        classes="param-input",
+                    )
             if inst.type in ("oscilloscope",):
                 for ch in ("C1", "C2", "C3", "C4"):
                     ch_cfg = current.channels.get(ch, {})
@@ -605,7 +593,7 @@ class InstrumentSetupScreen(Screen):
 
     def _save(self) -> None:
         inst = self.instrument
-        limits: dict[str, float] = {}
+        limits: dict = {}
         channels: dict[str, dict] = {}
 
         if inst.type == "function-generator":
@@ -613,14 +601,12 @@ class InstrumentSetupScreen(Screen):
                 lbl = self.query_one(f"#ch-{inst.slug}-{ch}-label", Input).value.strip()
                 if lbl:
                     channels[ch] = {"label": lbl}
-            for key in ("amplitude_max", "frequency_max"):
-                widget = self.query_one(f"#limit-{inst.slug}-{key}", Input)
-                val = widget.value.strip()
-                if val:
-                    try:
-                        limits[key] = float(val)
-                    except ValueError:
-                        pass
+            previous = next((s.limits for s in st.load_setup() if s.slug == inst.slug), {})
+            limits = st.limits_from_form(
+                {key: self.query_one(f"#limit-{inst.slug}-{key}", Input).value
+                 for key, _, _ in st.LIMIT_FIELDS},
+                previous,
+            )
 
         if inst.type == "oscilloscope":
             for ch in ("C1", "C2", "C3", "C4"):
@@ -911,6 +897,69 @@ class ProviderWizardScreen(Screen):
         self.app.pop_screen()
 
 
+class LauncherScreen(Screen):
+    """Landing screen: pick how to run teasel, or jump to the manage screens.
+
+    Launch items exit the Textual app returning a LaunchChoice; the plain CLI
+    layer then orchestrates the processes (see launcher.run_launch). Manage items
+    push the existing configuration screens."""
+
+    BINDINGS = [Binding("q", "quit", "Quit")]
+
+    _MENU = [
+        ("launch-standalone", "▶  Standalone — web UI + chat brain"),
+        ("launch-companion", "▶  Companion — Claude Code (+ web UI)"),
+        ("launch-mcp", "▶  MCP server only"),
+        ("launch-local", "▶  Local REPL — terminal chat"),
+        ("manage-instruments", "⚙  Instruments & setup"),
+        ("manage-llm", "⚙  LLM backends"),
+        ("manage-netlist", "⚙  Simulation netlist"),
+    ]
+
+    def compose(self) -> ComposeResult:
+        yield Header()
+        yield Label("", id="launcher-status", classes="setup-section")
+        yield ListView(
+            *[ListItem(Label(text), id=key) for key, text in self._MENU],
+            id="launcher-menu",
+        )
+        yield Footer()
+
+    def on_mount(self) -> None:
+        self._refresh_status()
+
+    def on_screen_resume(self) -> None:
+        self._refresh_status()
+
+    def _refresh_status(self) -> None:
+        cwd = Path.cwd()
+        n = len(st.load(cwd))
+        default = st.get_default_provider() or "none"
+        files = [f for f in (st.TEASEL_TOML, st.PROJECT_TOML) if (cwd / f).exists()]
+        files_str = ", ".join(files) if files else "no teasel.toml yet"
+        self.query_one("#launcher-status", Label).update(
+            f"[dim]{cwd}[/]\n{n} instrument(s)  ·  backend: [cyan]{default}[/]  ·  {files_str}"
+        )
+
+    @on(ListView.Selected, "#launcher-menu")
+    def menu_selected(self, event: ListView.Selected) -> None:
+        key = event.item.id or ""
+        if key == "launch-standalone":
+            self.app.exit(LaunchChoice(mode="standalone"))
+        elif key == "launch-companion":
+            self.app.exit(LaunchChoice(mode="companion"))
+        elif key == "launch-mcp":
+            self.app.exit(LaunchChoice(mode="mcp"))
+        elif key == "launch-local":
+            self.app.exit(LaunchChoice(mode="local"))
+        elif key == "manage-instruments":
+            self.app.push_screen(ConnectedScreen())
+        elif key == "manage-llm":
+            self.app.push_screen(LLMProvidersScreen())
+        elif key == "manage-netlist":
+            self.app.push_screen(NetlistScreen())
+
+
 class TeaselApp(App):
     CSS_PATH = "teasel.tcss"
     TITLE = "teasel"
@@ -918,8 +967,8 @@ class TeaselApp(App):
     def on_mount(self) -> None:
         from . import get_version
         self.sub_title = get_version()
-        self.push_screen(ConnectedScreen())
+        self.push_screen(LauncherScreen())
 
 
-def run_tui() -> None:
-    TeaselApp().run()
+def run_tui() -> LaunchChoice | None:
+    return TeaselApp().run()

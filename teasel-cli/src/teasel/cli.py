@@ -31,7 +31,10 @@ def _root(
         st.set_session_netlist(netlist)
     if ctx.invoked_subcommand is None:
         from .tui import run_tui
-        run_tui()
+        choice = run_tui()
+        if choice is not None:
+            from .launcher import run_launch
+            run_launch(choice)
 console = Console()
 err = Console(stderr=True)
 
