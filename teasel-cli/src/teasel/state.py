@@ -30,10 +30,58 @@ class InstrumentConfig:
         return self.driver or self.slug
 
 
+# project.toml [instruments.<slug>.limits]: numeric ceilings (amplitude_max Vpp,
+# voltage_max V peak incl. DC offset, frequency_max Hz) plus an optional free-text
+# `reason` that teasel-server quotes in every refusal. The server enforces them;
+# the CLI/web/TUI only edit them.
+LIMIT_TEXT_KEYS = ("reason",)
+LIMIT_FIELDS = (
+    # key, label, kind
+    ("amplitude_max", "Amplitude limit (Vpp)", "number"),
+    ("voltage_max", "Peak voltage limit (V, incl. DC offset)", "number"),
+    ("frequency_max", "Frequency limit (Hz)", "number"),
+    ("reason", "Reason (shown when a request is refused)", "text"),
+)
+
+
+def coerce_limits(data: dict) -> dict:
+    """Normalize a [limits] table: numeric keys → float, text keys kept as str,
+    unparseable numbers dropped."""
+    out: dict = {}
+    for k, v in (data or {}).items():
+        if k in LIMIT_TEXT_KEYS:
+            if str(v).strip():
+                out[k] = str(v)
+            continue
+        try:
+            out[k] = float(v)
+        except (TypeError, ValueError):
+            pass
+    return out
+
+
+def limits_from_form(values: dict[str, str], previous: dict | None = None) -> dict:
+    """Build a limits dict from form field values ({key: raw string}), keeping any
+    keys in ``previous`` the form doesn't know about (hand-edited project.toml)."""
+    out = {k: v for k, v in (previous or {}).items() if k not in values}
+    for k, raw in values.items():
+        raw = (raw or "").strip()
+        if not raw:
+            continue
+        if k in LIMIT_TEXT_KEYS:
+            out[k] = raw
+        else:
+            try:
+                out[k] = float(raw)
+            except ValueError:
+                pass
+    return out
+
+
 @dataclass
 class InstrumentSetup:
     slug: str
-    limits: dict[str, float] = field(default_factory=dict)
+    limits: dict[str, float | str] = field(default_factory=dict)
     channels: dict[str, dict] = field(default_factory=dict)
 
 
@@ -41,13 +89,14 @@ class InstrumentSetup:
 class ProviderConfig:
     """A named LLM backend bundle stored in ~/.teasel/llm.toml (holds secrets)."""
     name: str
-    type: str            # cloudflare | ollama | openai-compat
-    model: str = ""
+    type: str            # cloudflare | ollama | openai-compat | anthropic
+    model: str = ""      # default model for this backend
+    models: list[str] = field(default_factory=list)  # selectable models (one key, many models)
     account: str = ""    # cloudflare
     token: str = ""      # cloudflare
     url: str = ""        # ollama
     base_url: str = ""   # openai-compat
-    api_key: str = ""    # openai-compat
+    api_key: str = ""    # openai-compat / anthropic
 
 
 
@@ -118,10 +167,27 @@ def load_project_provider(directory: Path | None = None) -> str | None:
     return doc.get("llm", {}).get("provider")
 
 
-def save_project_provider(provider: str | None, directory: Path | None = None) -> None:
+def load_project_model(directory: Path | None = None) -> str | None:
+    """Return the model this project pins via teasel.toml [llm].model, if any.
+
+    Lets a single backend (one key) expose several models: the project pins both
+    which backend and which of its models to use."""
+    path = _toml_path(TEASEL_TOML, directory)
+    if not path.exists():
+        return None
+    doc = tomllib.loads(path.read_text())
+    return doc.get("llm", {}).get("model")
+
+
+def save_project_provider(
+    provider: str | None, directory: Path | None = None, model: str | None = None
+) -> None:
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
-    path.write_text(_serialize(load(directory), llm_provider=provider))
+    # Clearing the provider clears any pinned model with it.
+    path.write_text(_serialize(
+        load(directory), llm_provider=provider, llm_model=model if provider else None,
+    ))
 
 
 def find_netlists(directory: Path | None = None) -> list[Path]:
@@ -192,7 +258,11 @@ def save(instruments: list[InstrumentConfig], directory: Path | None = None) -> 
     directory = directory or Path.cwd()
     path = _toml_path(TEASEL_TOML, directory)
     old_text = path.read_text() if path.exists() else ""
-    new_text = _serialize(instruments, llm_provider=load_project_provider(directory))
+    new_text = _serialize(
+        instruments,
+        llm_provider=load_project_provider(directory),
+        llm_model=load_project_model(directory),
+    )
     path.write_text(new_text)
     _append_log(old_text, new_text, directory / TEASEL_LOG, "instruments")
 
@@ -200,11 +270,14 @@ def save(instruments: list[InstrumentConfig], directory: Path | None = None) -> 
 def _serialize(
     instruments: list[InstrumentConfig],
     llm_provider: str | None = None,
+    llm_model: str | None = None,
 ) -> str:
     lines = ["# teasel.toml — lab instruments and connections", ""]
     if llm_provider:
         lines.append("[llm]")
         lines.append(f'provider = "{_escape(llm_provider)}"')
+        if llm_model:
+            lines.append(f'model = "{_escape(llm_model)}"')
         lines.append("")
     for inst in instruments:
         lines.append(f"[instruments.{inst.slug}]")
@@ -227,7 +300,7 @@ def load_setup(directory: Path | None = None) -> list[InstrumentSetup]:
     return [
         InstrumentSetup(
             slug=slug,
-            limits={k: float(v) for k, v in data.get("limits", {}).items()},
+            limits=coerce_limits(data.get("limits", {})),
             channels={ch: dict(cfg) for ch, cfg in data.get("channels", {}).items()},
         )
         for slug, data in doc.get("instruments", {}).items()
@@ -240,7 +313,7 @@ def save_setup(setups: list[InstrumentSetup], directory: Path | None = None) -> 
     for s in setups:
         entry: dict = {}
         if s.limits:
-            entry["limits"] = {k: float(v) for k, v in s.limits.items()}
+            entry["limits"] = coerce_limits(s.limits)
         chans = {ch: dict(cfg) for ch, cfg in s.channels.items() if cfg}
         if chans:
             entry["channels"] = chans
@@ -268,6 +341,41 @@ def save_board_file(filename: str | None, directory: Path | None = None) -> None
     else:
         doc.pop("board", None)
     _write_project(doc, directory)
+
+
+# ── Journal document (project.toml [journal].file → a Markdown file on disk) ───
+#
+# The journal is a real .md file beside project.toml (like the board), so it's
+# prose-friendly and hand-editable outside teasel. Saving it doesn't touch
+# project.toml (so it won't trip the server's setup watcher) — live sync between
+# brain and browser rides the SSE journal_changed event instead.
+
+_JOURNAL_DEFAULT = "journal.md"
+
+
+def journal_filename(directory: Path | None = None) -> str:
+    """Journal filename within the project dir ([journal].file, default journal.md)."""
+    return _load_project(directory).get("journal", {}).get("file") or _JOURNAL_DEFAULT
+
+
+def load_journal(directory: Path | None = None) -> str:
+    """Return the project's journal Markdown, or '' if none yet."""
+    path = (directory or Path.cwd()) / journal_filename(directory)
+    try:
+        return path.read_text()
+    except Exception:
+        return ""
+
+
+def save_journal(content: str, directory: Path | None = None) -> None:
+    """Write the journal Markdown; record its [journal].file reference once."""
+    directory = directory or Path.cwd()
+    name = journal_filename(directory)
+    (directory / name).write_text(content)
+    doc = _load_project(directory)
+    if doc.get("journal", {}).get("file") != name:
+        doc.setdefault("journal", {})["file"] = name
+        _write_project(doc, directory)
 
 
 # ── Per-board probe maps (project.toml [boards."<file>".probes]) ───────────────
@@ -309,6 +417,47 @@ def save_probes(board: str | None, rows: list[dict], directory: Path | None = No
     _write_project(doc, directory)
 
 
+# ── UI workflow state (project.toml [ui]: mode + operator feedback) ───────────
+#
+# mode = standalone (web chat is the brain) | companion (Claude Code is the brain,
+# web UI is a live display). feedback is a rolling log of operator notes the brain
+# picks up via the server's setup-changed watcher + get_setup. Both are workflow
+# state about *this experiment*, so they live in project.toml beside the probe map.
+
+_VALID_UI_MODES = ("standalone", "companion")
+_FEEDBACK_CAP = 20
+
+
+def load_ui_mode(directory: Path | None = None) -> str:
+    mode = _load_project(directory).get("ui", {}).get("mode", "standalone")
+    return mode if mode in _VALID_UI_MODES else "standalone"
+
+
+def save_ui_mode(mode: str, directory: Path | None = None) -> None:
+    doc = _load_project(directory)
+    doc.setdefault("ui", {})["mode"] = mode if mode in _VALID_UI_MODES else "standalone"
+    _write_project(doc, directory)
+
+
+def load_feedback(directory: Path | None = None) -> list[str]:
+    """Operator notes (newest last), each a 'timestamp  note' string."""
+    return list(_load_project(directory).get("ui", {}).get("feedback", []))
+
+
+def append_feedback(note: str, directory: Path | None = None) -> None:
+    """Append an operator note (rolling, capped). Writing project.toml trips the
+    server's setup-changed watcher, so the brain learns about it on its next tool call."""
+    note = " ".join((note or "").split()).strip()
+    if not note:
+        return
+    doc = _load_project(directory)
+    ui = doc.setdefault("ui", {})
+    feedback = list(ui.get("feedback", []))
+    feedback.append(f"{datetime.now().isoformat(timespec='seconds')}  {note}")
+    ui["feedback"] = feedback[-_FEEDBACK_CAP:]
+    _write_project(doc, directory)
+
+
 # ── LLM provider bundles (~/.teasel/llm.toml) ─────────────────────────────────
 #
 # Single source of truth for inference backends. Each [providers.NAME] block is a
@@ -334,6 +483,7 @@ def load_providers() -> dict[str, ProviderConfig]:
             name=name,
             type=str(data.get("type", "")),
             model=str(data.get("model", "")),
+            models=[str(m) for m in data.get("models", []) if str(m).strip()],
             account=str(data.get("account", "")),
             token=str(data.get("token", "")),
             url=str(data.get("url", "")),
@@ -403,6 +553,9 @@ def _write_providers(providers: dict[str, ProviderConfig], default: str | None) 
             val = getattr(pc, fld)
             if val:
                 lines.append(f'{fld} = "{_escape(str(val))}"')
+        if pc.models:
+            arr = ", ".join(f'"{_escape(m)}"' for m in pc.models)
+            lines.append(f"models = [{arr}]")
         lines.append("")
     LLM_CONFIG_PATH.write_text("\n".join(lines))
 

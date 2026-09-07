@@ -1,6 +1,7 @@
 """Web UI for teasel — FastAPI + htmx + Pico CSS."""
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -9,7 +10,12 @@ import subprocess
 from pathlib import Path
 
 from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
+from fastapi.responses import (
+    FileResponse,
+    HTMLResponse,
+    RedirectResponse,
+    StreamingResponse,
+)
 from fastapi.staticfiles import StaticFiles
 
 from . import config as cfg
@@ -44,6 +50,344 @@ def artifact(name: str) -> FileResponse:
     if path.parent != _OUTPUT_DIR.resolve() or not path.exists():
         return HTMLResponse("not found", status_code=404)
     return FileResponse(path)
+
+
+# ── UI event push (server→browser) ────────────────────────────────────────────
+#
+# The only server→browser channel otherwise is the chat WebSocket, which is dead
+# in companion mode (Claude Code is the brain, the web chat is paused). This SSE
+# bus lets an MCP tool — run by either brain — push a live cue to the board view
+# (e.g. show_probe_point highlighting a net). One in-process subscriber set; the
+# single uvicorn worker (reload=False) makes that the correct shared state. If
+# this ever runs multi-worker, /ui/event would only reach same-worker tabs.
+_sse_subscribers: set[asyncio.Queue] = set()
+
+
+async def _sse_broadcast(event: dict) -> None:
+    """Fan an event out to every connected browser tab. A full queue (slow/dead
+    tab) drops the event for that tab rather than blocking the others."""
+    for q in list(_sse_subscribers):
+        try:
+            q.put_nowait(event)
+        except asyncio.QueueFull:
+            pass
+
+
+@app.get("/events")
+async def events() -> StreamingResponse:
+    """Server-Sent Events stream the browser subscribes to with EventSource."""
+    queue: asyncio.Queue = asyncio.Queue(maxsize=32)
+    _sse_subscribers.add(queue)
+
+    async def gen():
+        try:
+            yield ": connected\n\n"
+            while True:
+                try:
+                    event = await asyncio.wait_for(queue.get(), timeout=15)
+                except asyncio.TimeoutError:
+                    yield ": keepalive\n\n"  # keep proxies/uvicorn from idling us out
+                    continue
+                yield f"data: {json.dumps(event)}\n\n"
+        finally:
+            _sse_subscribers.discard(queue)
+
+    return StreamingResponse(
+        gen(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+# Allow-list of event types an external process may push. Visual cues only — no
+# state change, no secrets. Localhost-bound (the web UI default host is 127.0.0.1).
+_UI_EVENT_TYPES = {"probe_point", "journal_changed"}
+
+
+@app.post("/ui/event")
+async def ui_event(request: Request) -> dict:
+    """Ingress for an MCP tool (either brain) to push a UI cue. See _UI_EVENT_TYPES."""
+    try:
+        body = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+    etype = str(body.get("type", ""))
+    if etype not in _UI_EVENT_TYPES:
+        return {"ok": False, "error": f"unknown event type '{etype}'"}
+    if etype == "probe_point":
+        net = str(body.get("net", "")).strip()
+        if not net:
+            return {"ok": False, "error": "probe_point needs a 'net'"}
+        await _sse_broadcast({"type": "probe_point", "net": net})
+    elif etype == "journal_changed":
+        await _sse_broadcast({"type": "journal_changed", "path": str(body.get("path", ""))})
+    return {"ok": True}
+
+
+@app.post("/ui/feedback")
+async def ui_feedback(request: Request) -> dict:
+    """Operator → brain: append a free-text note to project.toml [ui].feedback. The
+    write trips teasel-server's setup watcher, so the brain sees it on its next tool
+    call (via get_setup). Keeps the human a peer, not a remote hand."""
+    try:
+        note = str((await request.json()).get("note", "")).strip()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+    if not note:
+        return {"ok": False, "error": "empty note"}
+    st.append_feedback(note, Path.cwd())
+    return {"ok": True, "count": len(st.load_feedback(Path.cwd()))}
+
+
+@app.get("/ui/mode")
+def get_ui_mode() -> dict:
+    return {"mode": st.load_ui_mode(Path.cwd())}
+
+
+@app.post("/ui/mode")
+async def set_ui_mode(request: Request) -> dict:
+    """standalone (web chat is the brain) | companion (Claude Code is the brain).
+    Persisted to project.toml [ui].mode."""
+    try:
+        mode = str((await request.json()).get("mode", "")).strip()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+    if mode not in ("standalone", "companion"):
+        return {"ok": False, "error": "mode must be 'standalone' or 'companion'"}
+    st.save_ui_mode(mode, Path.cwd())
+    return {"ok": True, "mode": mode}
+
+
+# ── Journal (per-project Markdown document) ───────────────────────────────────
+#
+# Rendered by default (marked.js, vendored offline); Edit reveals the Markdown
+# source; a gallery of teasel-output plots inserts image embeds at the cursor.
+# The LLM writes via the append_journal/write_journal MCP tools, which push a
+# journal_changed SSE event so the open tab refreshes live. Raw string so the
+# inline JS braces survive verbatim.
+_JOURNAL_BODY = r"""
+<style>
+  #journal-toolbar{display:flex;gap:.6rem;align-items:center;flex-wrap:wrap;margin-bottom:.6rem}
+  #journal-toolbar .spacer{flex:1}
+  #journal-view{border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);padding:1rem 1.25rem;background:var(--pico-card-background-color);min-height:50vh}
+  #journal-view img{max-width:100%;height:auto;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);display:block;margin:.5rem 0}
+  #journal-view :first-child{margin-top:0}
+  #journal-view .empty{color:var(--pico-muted-color)}
+  #journal-src{width:100%;min-height:50vh;font-family:ui-monospace,monospace;font-size:.85rem}
+  #journal-gallery{display:none;gap:.5rem;overflow-x:auto;padding:.5rem;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);margin-bottom:.6rem}
+  #journal-gallery figure{margin:0;flex:0 0 auto;width:120px;text-align:center}
+  #journal-gallery img{width:120px;height:80px;object-fit:contain;background:var(--pico-card-background-color);border:1px solid var(--pico-table-border-color);border-radius:6px;cursor:pointer}
+  #journal-gallery figcaption{font-size:.62rem;color:var(--pico-muted-color);overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #journal-notice{display:none;font-size:.8rem;color:var(--pico-color-amber-550);margin-bottom:.5rem}
+</style>
+<hgroup>
+  <h2>Journal</h2>
+  <p class="muted">A structured document for this project — the assistant can write here, you can edit, and plots can be pinned in. Saved as a Markdown file beside <code>project.toml</code>.</p>
+</hgroup>
+<div id="journal-toolbar">
+  <button id="journal-edit" style="width:auto">Edit</button>
+  <button id="journal-save" class="contrast" style="width:auto;display:none">Save</button>
+  <button id="journal-cancel" class="secondary outline" style="width:auto;display:none">Cancel</button>
+  <span class="spacer"></span>
+  <small id="journal-status" class="muted"></small>
+</div>
+<p id="journal-notice">The assistant updated this document. <a href="#" id="journal-reload">Discard my edits and reload</a>.</p>
+<div id="journal-gallery"></div>
+<div id="journal-view"><p class="empty">Nothing here yet. Click Edit to start, or ask the assistant to write it up.</p></div>
+<textarea id="journal-src" style="display:none" spellcheck="true"></textarea>
+<script src="/static/vendor/marked.min.js"></script>
+<script>
+(function(){
+  var view=document.getElementById('journal-view');
+  var src=document.getElementById('journal-src');
+  var gallery=document.getElementById('journal-gallery');
+  var notice=document.getElementById('journal-notice');
+  var statusEl=document.getElementById('journal-status');
+  var bEdit=document.getElementById('journal-edit');
+  var bSave=document.getElementById('journal-save');
+  var bCancel=document.getElementById('journal-cancel');
+  var editing=false, current='';
+  // Configure marked once, globally: drop raw HTML, and keep single-tilde subscripts
+  // (V~out~, f~3dB~) literal instead of GFM strikethrough — only ~~double~~ strikes.
+  try{
+    if(window.marked && !window.__teaselMd){
+      marked.use({
+        renderer:{html:function(){return '';}},
+        extensions:[{
+          name:'tildeLiteral', level:'inline',
+          start:function(src){ var i=src.indexOf('~'); return i<0?undefined:i; },
+          tokenizer:function(src){
+            var m=/^~(?!~)([^~\n]+)~(?!~)/.exec(src);
+            return m ? {type:'text', raw:m[0], text:m[0]} : undefined;
+          }
+        }]
+      });
+      window.__teaselMd=true;
+    }
+  }catch(_){}
+  var EMPTY='<p class="empty">Nothing here yet. Click Edit to start, or ask the assistant to write it up.</p>';
+
+  function render(md){
+    if(!md || !md.trim()){ view.innerHTML=EMPTY; return; }
+    try{ view.innerHTML=marked.parse(md); }catch(e){ view.textContent=md; return; }
+    // Artifacts are stored as paths relative to journal.md (so the file is portable
+    // on disk). Rewrite them to the served /artifacts/<name> route so they also
+    // render here in the app — by basename, which also fixes legacy /artifacts links.
+    view.querySelectorAll('img').forEach(function(img){
+      var base=(img.getAttribute('src')||'').split('/').pop();
+      if(/^(plot_|screenshot_).+\.(svg|png)$/.test(base)){ img.setAttribute('src','/artifacts/'+base); }
+    });
+  }
+  function load(){
+    return fetch('/journal').then(function(r){return r.json();}).then(function(d){
+      current=d.content||''; if(!editing){ render(current); } return current;
+    }).catch(function(){});
+  }
+  function setEditing(on){
+    editing=on;
+    view.style.display=on?'none':'';
+    src.style.display=on?'':'none';
+    gallery.style.display=on?'flex':'none';
+    bEdit.style.display=on?'none':'';
+    bSave.style.display=on?'':'none';
+    bCancel.style.display=on?'':'none';
+    notice.style.display='none';
+    if(on){ src.value=current; loadGallery(); src.focus(); }
+  }
+  bEdit.addEventListener('click', function(){ setEditing(true); });
+  bCancel.addEventListener('click', function(){ setEditing(false); render(current); });
+  bSave.addEventListener('click', function(){
+    var content=src.value; statusEl.textContent='saving…'; bSave.disabled=true;
+    fetch('/journal',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({content:content})})
+      .then(function(r){return r.json();}).then(function(d){
+        bSave.disabled=false;
+        if(d.ok){ current=content; statusEl.textContent='saved'; setEditing(false); render(current); }
+        else { statusEl.textContent=d.error||'save failed'; }
+      }).catch(function(){ bSave.disabled=false; statusEl.textContent='save failed'; });
+  });
+
+  function insertAtCursor(text){
+    var s=src.selectionStart||0, e=src.selectionEnd||0;
+    src.value=src.value.slice(0,s)+text+src.value.slice(e);
+    var pos=s+text.length; src.selectionStart=src.selectionEnd=pos; src.focus();
+  }
+  function loadGallery(){
+    fetch('/artifacts').then(function(r){return r.json();}).then(function(d){
+      var arts=(d&&d.artifacts)||[];
+      gallery.innerHTML='';
+      if(!arts.length){ gallery.innerHTML='<small class="muted" style="padding:.3rem">No plots yet — make one in the chat.</small>'; return; }
+      arts.forEach(function(a){
+        var fig=document.createElement('figure');
+        var img=document.createElement('img'); img.src='/artifacts/'+a.name; img.alt=a.name; img.title='Insert '+a.name;
+        img.addEventListener('click', function(){ insertAtCursor('\n![]('+'/artifacts/'+a.name+')\n'); });
+        var cap=document.createElement('figcaption'); cap.textContent=a.name;
+        fig.appendChild(img); fig.appendChild(cap); gallery.appendChild(fig);
+      });
+    }).catch(function(){});
+  }
+
+  // live updates from append_journal/write_journal (or another tab saving)
+  try{
+    var es=new EventSource('/events');
+    es.addEventListener('message', function(ev){
+      var m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
+      if(!m || m.type!=='journal_changed') return;
+      if(editing && src.value!==current){ notice.style.display=''; }  // don't clobber unsaved edits
+      else { load(); }
+    });
+  }catch(_){}
+  document.getElementById('journal-reload').addEventListener('click', function(e){
+    e.preventDefault(); setEditing(false); load();
+  });
+
+  load();
+  window.addEventListener('teasel:tab', function(e){ if(e.detail && e.detail.tab==='journal' && !editing){ load(); } });
+})();
+</script>
+"""
+
+
+@app.get("/journal")
+def get_journal() -> dict:
+    return {"content": st.load_journal(Path.cwd())}
+
+
+@app.post("/journal")
+async def post_journal(request: Request) -> dict:
+    try:
+        content = str((await request.json()).get("content", ""))
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+    st.save_journal(content, Path.cwd())
+    # Notify other open tabs (and any companion display) that the doc changed.
+    await _sse_broadcast({"type": "journal_changed", "path": st.journal_filename(Path.cwd())})
+    return {"ok": True}
+
+
+def _journal_image_ref(name: str) -> str:
+    """Path to an artifact *relative to the journal file*, so the embed resolves
+    when journal.md is opened on disk (editor preview, GitHub, an exported
+    datasheet) — not just behind the running web server's /artifacts route."""
+    journal_dir = Path.cwd().resolve()
+    target = (_OUTPUT_DIR / name).resolve()
+    try:
+        return Path(os.path.relpath(target, journal_dir)).as_posix()
+    except Exception:
+        return f"{_OUTPUT_DIR.name}/{name}"
+
+
+@app.post("/journal/append")
+async def append_journal_md(request: Request) -> dict:
+    """Append to the journal directly — no LLM round-trip. Backs the chat's
+    one-click 'Add to journal' buttons. Never overwrites the operator's prose
+    (same separator rule as the server's append_journal tool).
+
+    Accepts either a raw ``markdown`` snippet (assistant replies), or an
+    ``artifact`` filename + optional ``caption`` (plots/screenshots) — the latter
+    is rendered as a heading + image with a portable, journal-relative path."""
+    try:
+        data = await request.json()
+    except Exception:
+        return {"ok": False, "error": "invalid JSON"}
+
+    artifact = str(data.get("artifact", "")).strip()
+    if artifact:
+        if not _ARTIFACT_NAME.fullmatch(artifact) or not (_OUTPUT_DIR / artifact).exists():
+            return {"ok": False, "error": "unknown artifact"}
+        caption = str(data.get("caption", "")).strip() or artifact
+        markdown = f"### {caption}\n\n![{caption}]({_journal_image_ref(artifact)})"
+    else:
+        markdown = str(data.get("markdown", "")).strip()
+
+    if not markdown:
+        return {"ok": False, "error": "nothing to add"}
+    existing = st.load_journal(Path.cwd())
+    sep = "\n\n" if existing.strip() else ""
+    st.save_journal(existing + sep + markdown + "\n", Path.cwd())
+    await _sse_broadcast({"type": "journal_changed", "path": st.journal_filename(Path.cwd())})
+    return {"ok": True}
+
+
+_ARTIFACT_LIST_RE = re.compile(r"^(plot_.+\.(?:svg|png)|screenshot_.+\.png)$")
+
+
+@app.get("/artifacts")
+def list_artifacts() -> dict:
+    """Plot/screenshot files in teasel-output, newest first, for the journal gallery.
+    When a plot has both .svg and .png, only the .svg is listed (crisper embed)."""
+    items: list[dict] = []
+    if _OUTPUT_DIR.exists():
+        files = [p for p in _OUTPUT_DIR.iterdir()
+                 if p.is_file() and _ARTIFACT_LIST_RE.match(p.name)]
+        svg_stems = {p.stem for p in files if p.suffix == ".svg"}
+        files = [p for p in files
+                 if not (p.suffix == ".png" and p.name.startswith("plot_") and p.stem in svg_stems)]
+        files.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+        items = [
+            {"name": p.name, "kind": "screenshot" if p.name.startswith("screenshot_") else "plot"}
+            for p in files
+        ]
+    return {"artifacts": items}
 
 # Probe map — which PCB nets are wired to which instrument channels. Not ephemeral:
 # it's stored per-board in project.toml ([boards."<file>".probes]), so switching
@@ -129,7 +473,7 @@ _SUN  = '<svg xmlns="http://www.w3.org/2000/svg" width="18" height="18" viewBox=
 _TAB_SCRIPT = """
   <script>
   (function(){
-    var tabs=['instruments','board','chat','settings'];
+    var tabs=['instruments','board','chat','journal','settings'];
     function show(name){
       if(tabs.indexOf(name)<0) name='instruments';
       tabs.forEach(function(t){
@@ -164,6 +508,7 @@ def _page(body: str, back: str | None = None, active_tab: str | None = None) -> 
         '<li><a href="#instruments" class="tab-link" data-tab="instruments">Instruments</a></li>'
         '<li><a href="#board" class="tab-link" data-tab="board">Board</a></li>'
         '<li><a href="#chat" class="tab-link" data-tab="chat">Chat</a></li>'
+        '<li><a href="#journal" class="tab-link" data-tab="journal">Journal</a></li>'
         '<li><a href="#settings" class="tab-link" data-tab="settings">Settings</a></li>'
         '</ul>'
     ) if active_tab else ""
@@ -307,6 +652,7 @@ def index(saved: str = "") -> HTMLResponse:
         f'<section id="tab-instruments" class="tab-panel">{_instruments_panel(saved)}</section>'
         f'<section id="tab-board" class="tab-panel">{_PCB_BODY}</section>'
         f'<section id="tab-chat" class="tab-panel">{_CHAT_BODY}</section>'
+        f'<section id="tab-journal" class="tab-panel">{_JOURNAL_BODY}</section>'
         f'<section id="tab-settings" class="tab-panel">{_settings_panel(saved)}</section>'
     )
     return _page(shell, active_tab="instruments")
@@ -451,12 +797,40 @@ def _settings_panel(saved: str = "") -> str:
       </form>
     </article>"""
 
+    # ── Mode (standalone vs companion; persisted to project.toml [ui].mode) ──
+    mode = st.load_ui_mode(Path.cwd())
+    def _mchk(m: str) -> str:
+        return "checked" if mode == m else ""
+    mode_section = f"""
+    <article>
+      <h3 style="margin-top:0">Mode</h3>
+      <p class="muted" style="font-size:.85rem">Who drives the lab. <strong>Standalone</strong>: chat here in the
+         web UI. <strong>Companion</strong>: Claude Code is the brain and this UI is a live display (the web chat
+         pauses). Either way you stay a peer — re-point probes or leave notes and the assistant picks them up.
+         Saved to <code>project.toml</code>.</p>
+      <fieldset>
+        <label><input type="radio" name="ui-mode" value="standalone" {_mchk("standalone")} onchange="setMode(this.value)"> Standalone — web chat is the brain</label>
+        <label><input type="radio" name="ui-mode" value="companion" {_mchk("companion")} onchange="setMode(this.value)"> Companion — Claude Code is the brain</label>
+      </fieldset>
+      <small id="mode-msg" class="muted"></small>
+      <script>
+      function setMode(m){{
+        document.getElementById('mode-msg').textContent='saving…';
+        fetch('/ui/mode',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify({{mode:m}})}})
+          .then(function(r){{return r.json();}})
+          .then(function(d){{ if(d.ok){{ location.reload(); }} else {{ document.getElementById('mode-msg').textContent=d.error||'failed'; }} }})
+          .catch(function(){{ document.getElementById('mode-msg').textContent='failed'; }});
+      }}
+      </script>
+    </article>"""
+
     return f"""
     {banner}
     <hgroup>
       <h2>Settings</h2>
       <p class="muted">How teasel is wired up — inference, simulation, and the Claude MCP bridge.</p>
     </hgroup>
+    {mode_section}
     {llm_section}
     {sim_section}
     {mcp_section}
@@ -883,22 +1257,61 @@ def api_instruments() -> list[dict]:
 # the page.
 
 _CHAT_BODY = r"""
-<hgroup>
-  <h2>Lab chat</h2>
-  <p class="muted" id="chat-status">connecting…</p>
-</hgroup>
+<div style="display:flex;align-items:flex-start;justify-content:space-between;gap:1rem;flex-wrap:wrap">
+  <hgroup style="margin:0">
+    <h2 style="margin:0">Lab chat</h2>
+    <p class="muted" id="chat-status" style="margin:0">connecting…</p>
+  </hgroup>
+  <label style="margin:0;font-size:.78rem;color:var(--pico-muted-color);display:flex;align-items:center;gap:.4rem;white-space:nowrap">
+    Model
+    <select id="chat-model" style="margin:0;padding:.15rem .45rem;font-size:.78rem;width:auto;background-position:right .4rem center"></select>
+  </label>
+</div>
 <p id="chat-probe" class="muted" style="margin:-.4rem 0 .5rem;font-size:.82rem"></p>
 <style>
   #chat-log{height:55vh;overflow-y:auto;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);padding:.75rem;display:flex;flex-direction:column;gap:.5rem;margin-bottom:.75rem;background:var(--pico-card-background-color)}
   #chat-log .msg{max-width:85%;padding:.4rem .65rem;border-radius:10px;font-size:.9rem;line-height:1.4;white-space:pre-wrap;word-wrap:break-word}
   #chat-log .user{align-self:flex-end;background:var(--pico-primary-background);color:var(--pico-primary-inverse);border-bottom-right-radius:3px}
   #chat-log .assistant{align-self:flex-start;background:var(--pico-code-background-color);border-bottom-left-radius:3px}
+  /* Markdown-rendered assistant bubble: normal wrapping + tamed block spacing so
+     **bold**, lists, headings and `code` look right inside the bubble. */
+  #chat-log .assistant.md{white-space:normal}
+  #chat-log .assistant.md > :first-child{margin-top:0}
+  #chat-log .assistant.md > :last-child{margin-bottom:0}
+  #chat-log .assistant.md p{margin:.4rem 0}
+  #chat-log .assistant.md ul,#chat-log .assistant.md ol{margin:.4rem 0;padding-left:1.25rem}
+  #chat-log .assistant.md li{margin:.1rem 0}
+  #chat-log .assistant.md h1,#chat-log .assistant.md h2,#chat-log .assistant.md h3,#chat-log .assistant.md h4{font-size:1em;font-weight:700;margin:.5rem 0 .2rem}
+  #chat-log .assistant.md code{background:var(--pico-card-background-color);padding:.05rem .3rem;border-radius:4px;font-size:.85em}
+  #chat-log .assistant.md pre{background:var(--pico-card-background-color);border:1px solid var(--pico-table-border-color);border-radius:6px;padding:.5rem .6rem;margin:.4rem 0;overflow-x:auto}
+  #chat-log .assistant.md pre code{background:none;padding:0}
+  #chat-log .assistant.md a{color:var(--pico-primary)}
+  #chat-log .assistant.md blockquote{margin:.4rem 0;padding-left:.6rem;border-left:2px solid var(--pico-table-border-color);color:var(--pico-muted-color)}
+  #chat-log .assistant.md table{border-collapse:collapse;margin:.4rem 0;font-size:.85em}
+  #chat-log .assistant.md th,#chat-log .assistant.md td{border:1px solid var(--pico-table-border-color);padding:.2rem .4rem}
   #chat-log .trace{align-self:flex-start;font-family:ui-monospace,monospace;font-size:.72rem;color:var(--pico-muted-color);white-space:pre-wrap;word-break:break-all;max-width:100%}
   #chat-log .guardrail{align-self:flex-start;font-size:.75rem;color:var(--pico-color-amber-550)}
   #chat-log .error{align-self:flex-start;font-size:.82rem;color:var(--pico-color-red-550)}
   #chat-log .empty{margin:auto;color:var(--pico-muted-color);font-size:.85rem;text-align:center}
   #chat-log .artifact{align-self:flex-start;max-width:92%}
   #chat-log .artifact img{display:block;max-width:100%;border-radius:10px;border:1px solid var(--pico-table-border-color)}
+  #chat-log .to-journal{align-self:flex-start;width:auto;margin:.15rem 0 .2rem;padding:.1rem .5rem;font-size:.72rem;line-height:1.5;background:transparent;border:1px solid var(--pico-primary);color:var(--pico-primary)}
+  #chat-log .to-journal:hover{background:var(--pico-primary);color:var(--pico-primary-inverse)}
+  #chat-log .to-journal.added{border-color:var(--pico-color-jade-550);color:var(--pico-color-jade-550);background:transparent;cursor:default}
+  /* Caption modal — a small styled popup, replaces the native window.prompt. */
+  #cap-overlay{position:fixed;inset:0;background:rgba(0,0,0,.45);backdrop-filter:blur(2px);display:none;align-items:center;justify-content:center;z-index:1000}
+  #cap-overlay.open{display:flex;animation:capfade .12s ease}
+  @keyframes capfade{from{opacity:0}to{opacity:1}}
+  #cap-modal{background:var(--pico-card-background-color);border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);padding:1.25rem 1.4rem 1.1rem;width:min(28rem,92vw);box-shadow:0 16px 48px rgba(0,0,0,.4);animation:capin .16s cubic-bezier(.2,.8,.3,1)}
+  @keyframes capin{from{opacity:0;transform:translateY(8px) scale(.97)}to{opacity:1;transform:none}}
+  #cap-modal h4{margin:0 0 .1rem;font-size:1rem}
+  #cap-modal .cap-sub{font-size:.8rem;color:var(--pico-muted-color);margin:0 0 .85rem}
+  #cap-modal .cap-preview{display:flex;align-items:center;gap:.6rem;margin:0 0 .85rem;padding:.4rem;border:1px solid var(--pico-table-border-color);border-radius:8px;background:var(--pico-code-background-color)}
+  #cap-modal .cap-preview img{width:64px;height:44px;object-fit:contain;border-radius:4px;flex:0 0 auto}
+  #cap-modal .cap-preview small{color:var(--pico-muted-color);overflow-wrap:anywhere}
+  #cap-modal input{margin:0 0 1rem}
+  #cap-modal .cap-actions{display:flex;gap:.5rem;justify-content:flex-end}
+  #cap-modal .cap-actions button{width:auto;margin:0}
 </style>
 <div id="chat-log"><div class="empty">Ask teasel to read or drive a connected instrument.</div></div>
 <form id="chat-form" autocomplete="off" hx-boost="false">
@@ -907,6 +1320,18 @@ _CHAT_BODY = r"""
     <button id="chat-send" type="submit" disabled style="width:auto">Send</button>
   </fieldset>
 </form>
+<div id="cap-overlay">
+  <div id="cap-modal" role="dialog" aria-modal="true" aria-labelledby="cap-title">
+    <h4 id="cap-title">Add to journal</h4>
+    <p class="cap-sub">Give this capture a caption.</p>
+    <div class="cap-preview"><img id="cap-thumb" alt=""><small id="cap-file"></small></div>
+    <input id="cap-input" autocomplete="off" placeholder="Caption">
+    <div class="cap-actions">
+      <button type="button" id="cap-cancel" class="secondary outline">Cancel</button>
+      <button type="button" id="cap-add">Add to journal</button>
+    </div>
+  </div>
+</div>
 <script>
 (function(){
   var log=document.getElementById('chat-log');
@@ -933,37 +1358,221 @@ _CHAT_BODY = r"""
     log.appendChild(d); log.scrollTop=log.scrollHeight; return d;
   }
   function busy(b){ input.disabled=b; send.disabled=b; if(!b){input.focus();} }
-  // Tool results that saved a plot or screenshot get the image inlined.
+  // One-click capture into the journal — appends Markdown directly (no LLM round-trip).
+  function journalPost(payload, btn){
+    if(btn){ btn.disabled=true; }
+    fetch('/journal/append',{method:'POST',headers:{'Content-Type':'application/json'},
+                             body:JSON.stringify(payload)})
+      .then(function(r){return r.json();})
+      .then(function(d){
+        if(d.ok){ if(btn){ btn.textContent='✓ in journal'; btn.classList.add('added'); } }
+        else { if(btn){ btn.textContent='failed'; btn.disabled=false; } }
+      })
+      .catch(function(){ if(btn){ btn.textContent='failed'; btn.disabled=false; } });
+  }
+  function journalAppend(markdown, btn){ journalPost({markdown:markdown}, btn); }
+  // A '+ Journal' button that appends fixed Markdown (used for assistant replies).
+  function journalButton(markdown, label){
+    var b=document.createElement('button'); b.type='button'; b.className='to-journal';
+    b.textContent=label||'+ Journal'; b.title='Add this to the project journal';
+    b.addEventListener('click', function(){
+      if(!(markdown||'').trim()){ return; }
+      journalAppend(markdown, b);
+    });
+    return b;
+  }
+  // Styled caption modal (replaces native window.prompt). promptCaption resolves
+  // to the caption string, or null if the user cancelled.
+  var _capEls=null, _capResolve=null;
+  function _capModal(){
+    if(_capEls){ return _capEls; }
+    var o=document.getElementById('cap-overlay');
+    _capEls={o:o, input:document.getElementById('cap-input'),
+             add:document.getElementById('cap-add'), cancel:document.getElementById('cap-cancel'),
+             thumb:document.getElementById('cap-thumb'), file:document.getElementById('cap-file')};
+    function done(val){ o.classList.remove('open'); var r=_capResolve; _capResolve=null; if(r){ r(val); } }
+    _capEls.add.addEventListener('click', function(){ done(_capEls.input.value); });
+    _capEls.cancel.addEventListener('click', function(){ done(null); });
+    o.addEventListener('click', function(e){ if(e.target===o){ done(null); } });
+    _capEls.input.addEventListener('keydown', function(e){
+      if(e.key==='Enter'){ e.preventDefault(); done(_capEls.input.value); }
+      else if(e.key==='Escape'){ e.preventDefault(); done(null); }
+    });
+    return _capEls;
+  }
+  function promptCaption(def, name){
+    var el=_capModal();
+    el.thumb.src='/artifacts/'+name; el.file.textContent=name;
+    el.input.value=def;
+    var p=new Promise(function(resolve){ _capResolve=resolve; });
+    el.o.classList.add('open');
+    setTimeout(function(){ el.input.focus(); el.input.select(); }, 0);
+    return p;
+  }
+  // A '+ Journal' button for a plot/screenshot — opens the caption modal (prefilled
+  // with a timestamp, so Enter is enough) and pins it under a heading.
+  function artifactJournalButton(name, isShot){
+    var b=document.createElement('button'); b.type='button'; b.className='to-journal';
+    b.textContent='+ Journal'; b.title='Add this '+(isShot?'screenshot':'plot')+' to the journal';
+    b.addEventListener('click', function(){
+      if(b.classList.contains('added')){ return; }
+      var def=(isShot?'Screenshot — ':'Plot — ')+new Date().toLocaleString();
+      promptCaption(def, name).then(function(cap){
+        if(cap===null){ return; }          // cancelled
+        // Server builds the heading + a journal-relative image path (portable).
+        journalPost({caption:cap.trim()||def, artifact:name}, b);
+      });
+    });
+    return b;
+  }
+  // Tool results that saved a plot or screenshot get the image inlined, each with
+  // a button to pin it into the journal.
   function addArtifacts(text){
     var re=/\b(plot_[A-Za-z0-9_]+\.svg|screenshot_[A-Za-z0-9._-]+\.png)\b/g, m, seen={};
     while((m=re.exec(text||''))!==null){
       if(seen[m[1]]){continue;} seen[m[1]]=true;
+      var name=m[1];
       var d=document.createElement('div'); d.className='artifact';
-      var img=document.createElement('img'); img.src='/artifacts/'+m[1]; img.alt=m[1];
+      var img=document.createElement('img'); img.src='/artifacts/'+name; img.alt=name;
       img.onload=function(){ log.scrollTop=log.scrollHeight; };
       img.onerror=function(){ d.remove(); };
-      d.appendChild(img); log.appendChild(d); log.scrollTop=log.scrollHeight;
+      d.appendChild(img);
+      d.appendChild(artifactJournalButton(name, name.indexOf('screenshot_')===0));
+      log.appendChild(d); log.scrollTop=log.scrollHeight;
+    }
+  }
+  // Configure marked once, globally (it's a singleton shared with the Journal):
+  // drop raw HTML, and stop single-tilde subscripts/approximations the models emit
+  // (V~out~, f~3dB~, ~10~20 ms) from rendering as GFM strikethrough — only real
+  // ~~double~~ tildes strike through. Guarded so it registers exactly once.
+  function setupMarked(){
+    if(!window.marked){ return false; }
+    if(!window.__teaselMd){
+      marked.use({
+        renderer:{html:function(){return '';}},
+        extensions:[{
+          name:'tildeLiteral', level:'inline',
+          start:function(src){ var i=src.indexOf('~'); return i<0?undefined:i; },
+          tokenizer:function(src){
+            var m=/^~(?!~)([^~\n]+)~(?!~)/.exec(src);
+            return m ? {type:'text', raw:m[0], text:m[0]} : undefined;
+          }
+        }]
+      });
+      window.__teaselMd=true;
+    }
+    return true;
+  }
+  // Assistant text is Markdown (models emit **bold**, lists, `code`, …). Render it
+  // with marked (the same lib the Journal uses, raw HTML dropped); fall back to the
+  // plain textContent set by add() if marked is unavailable or parsing fails.
+  function renderMarkdown(el, text){
+    if(!setupMarked()){ return; }
+    try{
+      el.innerHTML=marked.parse(text); el.classList.add('md');
+      // Models often embed the plot they just made as a path relative to the project
+      // (teasel-output/plot_….png). Serve it via /artifacts/<basename>, as the Journal does.
+      el.querySelectorAll('img').forEach(function(img){
+        var base=(img.getAttribute('src')||'').split('/').pop();
+        if(/^(plot_|screenshot_).+\.(svg|png)$/.test(base)){ img.setAttribute('src','/artifacts/'+base); }
+        img.onerror=function(){ img.remove(); };
+      });
+    }
+    catch(_){ /* keep the plain-text fallback */ }
+  }
+  // Assistant reply bubble, with a button to capture its text into the journal.
+  function addAssistant(text){
+    var d=add('msg assistant', text);   // textContent — safe fallback
+    if((text||'').trim()){
+      renderMarkdown(d, text);
+      log.appendChild(journalButton(text)); log.scrollTop=log.scrollHeight;
     }
   }
   var proto=location.protocol==='https:'?'wss:':'ws:';
-  var ws=new WebSocket(proto+'//'+location.host+'/ws/chat?brain=local');
-  ws.onclose=function(){ busy(true); statusEl.textContent='disconnected — reload to reconnect'; };
-  ws.onerror=function(){ statusEl.textContent='connection error'; };
-  ws.onmessage=function(e){
-    var m=JSON.parse(e.data);
+  var ws=null, modelSel=document.getElementById('chat-model');
+  var EMPTY_CHAT='Ask teasel to read or drive a connected instrument.';
+  function render(m){
     if(m.type==='ready'){ statusEl.textContent=m.provider+' · '+m.model+' · '+m.tools+' tools'; busy(false); }
-    else if(m.type==='text'){ add('msg assistant', m.text); }
+    else if(m.type==='history'){
+      // Rebuild the log to match the server's persisted transcript: restores a
+      // conversation across reload/navigation, or clears it on a fresh chat.
+      log.innerHTML=''; (m.events||[]).forEach(render);
+      if(!log.children.length){ log.innerHTML='<div class="empty">'+EMPTY_CHAT+'</div>'; }
+      log.scrollTop=log.scrollHeight;
+    }
+    else if(m.type==='user'){ add('msg user', m.text); }
+    else if(m.type==='text'){ addAssistant(m.text); }
     else if(m.type==='tool_call'){ m.calls.forEach(function(c){ add('trace','→ '+c.name+'('+JSON.stringify(c.args)+')'); }); }
     else if(m.type==='tool_result'){ add('trace','← '+(m.text||'').split('\n')[0].slice(0,200)); addArtifacts(m.text); }
     else if(m.type==='guardrail'){ add('guardrail','⚠ '+m.label+': '+(m.text||'').split('\n')[0].slice(0,200)); }
     else if(m.type==='error'){ add('error', m.text); busy(false); }
     else if(m.type==='done'){ busy(false); }
-  };
+  }
+  function onmessage(e){ render(JSON.parse(e.data)); }
+  // The chat reads its backend from resolve_provider (project pin → global
+  // default), so connect() takes no provider arg — picking a model persists the
+  // pin server-side first, then we reconnect to pick it up.
+  function connect(){
+    if(ws){ ws.onclose=null; try{ ws.close(); }catch(_){} }
+    busy(true); statusEl.textContent='connecting…';
+    ws=new WebSocket(proto+'//'+location.host+'/ws/chat?brain=local');
+    ws.onclose=function(){ busy(true); statusEl.textContent='disconnected — reload to reconnect'; };
+    ws.onerror=function(){ statusEl.textContent='connection error'; };
+    ws.onmessage=onmessage;
+  }
+  function companionBanner(){
+    statusEl.textContent='Companion mode — Claude Code is driving; chat paused.';
+    var empty=log.querySelector('.empty');
+    if(empty){ empty.textContent='Companion mode: Claude Code is the brain. Switch to Standalone in Settings to chat here.'; }
+    busy(true);
+  }
+  // Populate the picker; the effective backend (project pin or global default) is
+  // preselected. Choosing one pins it to this project's teasel.toml — it persists
+  // across restarts — then reconnects the chat on it.
+  function startChat(){
+   fetch('/llm/providers').then(function(r){return r.json();}).then(function(d){
+    var provs=(d&&d.providers)||[];
+    if(modelSel && provs.length){
+      modelSel.innerHTML='';
+      // One option per (backend, model): a backend with several models contributes
+      // several rows. Provider+model ride on data-attrs so labels stay readable.
+      provs.forEach(function(p){
+        var ms=(p.models&&p.models.length)?p.models:[p.model||''];
+        ms.forEach(function(mid){
+          var o=document.createElement('option');
+          o.value=p.name+'␟'+mid;
+          o.setAttribute('data-provider',p.name); o.setAttribute('data-model',mid);
+          o.textContent=p.name+(mid?' — '+mid:'');
+          if(p.name===d.effective && (mid===d.effective_model || (!d.effective_model&&mid===(p.model||'')))){ o.selected=true; }
+          modelSel.appendChild(o);
+        });
+      });
+      modelSel.addEventListener('change',function(){
+        var opt=modelSel.options[modelSel.selectedIndex];
+        var name=opt.getAttribute('data-provider'), mid=opt.getAttribute('data-model');
+        fetch('/llm/project-provider',{method:'POST',headers:{'Content-Type':'application/json'},
+                                       body:JSON.stringify({name:name,model:mid})})
+          .then(function(r){return r.json();})
+          .then(function(d){
+            if(d.ok){ add('guardrail','📌 pinned '+name+(mid?' · '+mid:'')+' to this project — starting a fresh chat'); connect(); }
+            else { add('error', d.error||'could not pin model'); }
+          })
+          .catch(function(){ add('error','could not save model choice'); });
+      });
+    }
+    connect();
+   }).catch(function(){ connect(); });
+  }
+  // Companion mode: Claude Code is the brain — don't open a chat WS to :7891.
+  fetch('/ui/mode').then(function(r){return r.json();}).then(function(d){
+    if(d && d.mode==='companion'){ companionBanner(); } else { startChat(); }
+  }).catch(function(){ startChat(); });
   form.addEventListener('submit',function(ev){
     ev.preventDefault();
     var text=input.value.trim();
-    if(!text||ws.readyState!==1){ return; }
-    add('msg user', text);
+    if(!text||!ws||ws.readyState!==1){ return; }
+    // The server echoes the user message back (type:"user") as the single source
+    // of truth, so it lands in the persisted transcript and replays on reconnect.
     ws.send(text);
     input.value=''; busy(true);
   });
@@ -976,6 +1585,136 @@ _CHAT_BODY = r"""
 def chat_page() -> RedirectResponse:
     # Chat now lives in the single-page shell; keep the old URL working.
     return RedirectResponse("/#chat", status_code=307)
+
+
+# ── persistent chat room ──────────────────────────────────────────────────────
+#
+# The forge ChatSession holds an MCP/anyio connection that is *task-affinity
+# bound* — it must be entered, used, and exited on one task. So a single
+# long-lived owner task owns the session; WebSocket connections are thin
+# subscribers. This keeps the conversation alive across page reloads and
+# navigation: a reconnecting browser gets the transcript replayed AND the live
+# LLM context is untouched. The room rebuilds when the provider/model pin
+# changes (a deliberate "fresh chat") or on connection failure.
+
+# Event types that make up the visible transcript (replayed on reconnect).
+# "ready"/"done"/"history" are connection-level, not conversation, so excluded.
+_PERSIST_TYPES = {"user", "text", "tool_call", "tool_result", "guardrail"}
+_TRANSCRIPT_CAP = 800  # bound memory on very long sessions
+
+
+async def _safe_send(ws: WebSocket, payload: dict) -> bool:
+    try:
+        await ws.send_json(payload)
+        return True
+    except Exception:
+        return False
+
+
+class ChatRoom:
+    def __init__(self) -> None:
+        self._lock = asyncio.Lock()
+        self._owner: asyncio.Task | None = None
+        self._inbox: asyncio.Queue = asyncio.Queue()
+        self._subs: set[WebSocket] = set()
+        self._transcript: list[dict] = []
+        self._ready: dict | None = None
+        self._error: str | None = None
+        self._key: tuple | None = None
+        self._started: asyncio.Event = asyncio.Event()
+
+    async def attach(self, websocket: WebSocket, pc, model_override) -> bool:
+        """Subscribe a socket; (re)start the owner if needed; replay transcript.
+        Returns False if the session is unavailable (error already sent)."""
+        key = (pc.name, model_override or "")
+        async with self._lock:
+            if self._owner is None or self._owner.done() or self._key != key:
+                await self._stop_locked()
+                self._key = key
+                self._ready = None
+                self._error = None
+                self._transcript = []
+                self._started = asyncio.Event()
+                self._inbox = asyncio.Queue()
+                self._owner = asyncio.create_task(self._run(pc, model_override))
+            await self._started.wait()
+            if self._error is not None:
+                await _safe_send(websocket, {"type": "error", "text": self._error})
+                return False
+            self._subs.add(websocket)
+            await _safe_send(websocket, self._ready)
+            # Always send history (even empty) so the browser rebuilds its log to
+            # match the server — restoring a conversation, or clearing it on a
+            # fresh-chat repin.
+            await _safe_send(websocket, {"type": "history", "events": self._transcript})
+            return True
+
+    def detach(self, websocket: WebSocket) -> None:
+        self._subs.discard(websocket)
+
+    async def submit(self, text: str) -> None:
+        await self._inbox.put(text)
+
+    def _record(self, ev: dict) -> None:
+        if ev.get("type") in _PERSIST_TYPES:
+            self._transcript.append(ev)
+            if len(self._transcript) > _TRANSCRIPT_CAP:
+                del self._transcript[: len(self._transcript) - _TRANSCRIPT_CAP]
+
+    async def _broadcast(self, ev: dict) -> None:
+        for ws in list(self._subs):
+            if not await _safe_send(ws, ev):
+                self._subs.discard(ws)
+
+    async def _emit(self, ev: dict) -> None:
+        self._record(ev)
+        await self._broadcast(ev)
+
+    async def _run(self, pc, model_override) -> None:
+        try:
+            client, model = client_from_provider(pc, model_override)
+            async with chat_session(client, DEFAULT_TEASEL_URL) as session:
+                self._ready = {
+                    "type": "ready",
+                    "provider": pc.name,
+                    "model": model,
+                    "tools": session.tool_count,
+                }
+                self._started.set()
+                while True:
+                    text = await self._inbox.get()
+                    if text is None:
+                        return
+                    await self._emit({"type": "user", "text": text})
+                    await session.run_turn(_with_probes(text), self._emit)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            self._error = (
+                f"Could not reach teasel-server at {DEFAULT_TEASEL_URL} ({exc}). "
+                "Start it with: teasel-server --transport streamable-http"
+            )
+            self._started.set()  # unblock any waiting attach()
+            await self._broadcast({"type": "error", "text": self._error})
+
+    async def _stop_locked(self) -> None:
+        if self._owner is not None and not self._owner.done():
+            await self._inbox.put(None)
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(self._owner), timeout=10)
+        self._owner = None
+
+    async def stop(self) -> None:
+        async with self._lock:
+            await self._stop_locked()
+
+
+_room = ChatRoom()
+
+
+@app.on_event("shutdown")
+async def _shutdown_chat_room() -> None:
+    await _room.stop()
 
 
 @app.websocket("/ws/chat")
@@ -992,42 +1731,37 @@ async def ws_chat(websocket: WebSocket) -> None:
         await websocket.close()
         return
 
-    pc = st.resolve_provider(None, Path.cwd())
+    # The chat model picker pins its choice in teasel.toml (persistent), which
+    # resolve_provider reads as the project pin. ?provider= remains a one-off
+    # session override (e.g. for other callers); an unknown name falls through
+    # to None below.
+    provider_override = websocket.query_params.get("provider") or None
+    pc = st.resolve_provider(provider_override, Path.cwd())
     if pc is None:
+        which = f" '{provider_override}'" if provider_override else ""
         await websocket.send_json({
             "type": "error",
-            "text": "No LLM backend configured. Add one under LLM settings, then reload.",
+            "text": f"No LLM backend{which} configured. Add one under LLM settings, then reload.",
         })
         await websocket.close()
         return
 
-    client, model = client_from_provider(pc)
+    # When using the project pin (no ?provider= override), honor the pinned model
+    # too, so a one-backend-many-models setup runs the chosen model.
+    model_override = None if provider_override else st.load_project_model(Path.cwd())
+    if not await _room.attach(websocket, pc, model_override):
+        with contextlib.suppress(Exception):
+            await websocket.close()
+        return
     try:
-        async with chat_session(client, DEFAULT_TEASEL_URL) as session:
-            await websocket.send_json({
-                "type": "ready",
-                "provider": pc.name,
-                "model": model,
-                "tools": session.tool_count,
-            })
-            while True:
-                user_input = (await websocket.receive_text()).strip()
-                if user_input:
-                    await session.run_turn(_with_probes(user_input), websocket.send_json)
+        while True:
+            user_input = (await websocket.receive_text()).strip()
+            if user_input:
+                await _room.submit(user_input)
     except WebSocketDisconnect:
         pass
-    except Exception as exc:
-        # Most likely teasel-server isn't running — surface it instead of a
-        # silent drop. Best-effort; the socket may already be gone.
-        try:
-            await websocket.send_json({
-                "type": "error",
-                "text": f"Could not reach teasel-server at {DEFAULT_TEASEL_URL} ({exc}). "
-                        "Start it with: teasel-server --transport streamable-http",
-            })
-            await websocket.close()
-        except Exception:
-            pass
+    finally:
+        _room.detach(websocket)
 
 
 # ── PCB probe (/pcb) ──────────────────────────────────────────────────────────
@@ -1045,6 +1779,8 @@ _PCB_BODY = r"""
   #pcb-view{flex:1 1 460px;min-width:0;height:66vh;border:1px solid var(--pico-table-border-color);border-radius:var(--pico-border-radius);overflow:hidden;background:var(--pico-card-background-color)}
   #pcb-view kicanvas-embed{display:block;width:100%;height:100%}
   #pcb-view .ph{padding:1rem;color:var(--pico-muted-color);font-size:.85rem}
+  #pcb-view.probe-pulse{animation:boardpulse 1.6s ease}
+  @keyframes boardpulse{0%,100%{border-color:var(--pico-table-border-color)}25%,60%{border-color:var(--pico-primary);box-shadow:0 0 0 2px var(--pico-primary-background)}}
   /* fixed-width panel so labels don't reflow the layout as nets/channels change */
   #probe-panel{flex:0 0 340px;max-width:340px;min-width:0;display:flex;flex-direction:column}
   #probe-panel h3{margin-bottom:.5rem}
@@ -1080,6 +1816,14 @@ _PCB_BODY = r"""
     <p id="probe-empty" class="muted">Click a net on the board to add it here.</p>
     <p id="probe-nochan" class="muted" style="display:none">Add an instrument under the Instruments tab to assign channels.</p>
     <span style="flex:1"></span>
+    <div id="feedback-box" style="margin-top:.6rem;border-top:1px solid var(--pico-table-border-color);padding-top:.5rem">
+      <small class="muted" style="display:block;margin-bottom:.3rem">Note to the assistant (e.g. "moved probe to TP4"):</small>
+      <fieldset role="group" style="margin:0">
+        <input id="feedback-input" placeholder="tell the assistant something…" style="font-size:.8rem;margin:0">
+        <button id="feedback-send" class="outline" style="width:auto;font-size:.8rem;margin:0">Send</button>
+      </fieldset>
+      <small id="feedback-msg" class="muted" style="font-size:.72rem"></small>
+    </div>
     <a href="#chat" role="button" class="outline" style="width:auto;margin-top:.5rem">Open lab chat →</a>
   </div>
 </div>
@@ -1093,6 +1837,24 @@ _PCB_BODY = r"""
   var tbody=document.querySelector('#probe-table tbody');
   var emptyEl=document.getElementById('probe-empty');
   var nochanEl=document.getElementById('probe-nochan');
+
+  // ── operator → assistant: free-text note (reverse half of the loop) ──
+  var fbInput=document.getElementById('feedback-input');
+  var fbSend=document.getElementById('feedback-send');
+  var fbMsg=document.getElementById('feedback-msg');
+  function sendFeedback(){
+    var note=(fbInput.value||'').trim();
+    if(!note) return;
+    fbSend.disabled=true; fbMsg.textContent='sending…';
+    fetch('/ui/feedback',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({note:note})})
+      .then(function(r){return r.json();})
+      .then(function(d){ fbSend.disabled=false;
+        if(d.ok){ fbInput.value=''; fbMsg.textContent='sent — the assistant sees it on its next step.'; }
+        else { fbMsg.textContent=d.error||'failed'; } })
+      .catch(function(){ fbSend.disabled=false; fbMsg.textContent='failed'; });
+  }
+  if(fbSend){ fbSend.addEventListener('click', sendFeedback); }
+  if(fbInput){ fbInput.addEventListener('keydown', function(e){ if(e.key==='Enter'){ e.preventDefault(); sendFeedback(); } }); }
 
   // ── probe-map state (source of truth = project.toml via /pcb/probes) ──
   var channels=[];   // [{instrument, channel, label, default_role, ...}]
@@ -1202,6 +1964,24 @@ _PCB_BODY = r"""
   }
   loadProbes();
 
+  // ── live cues pushed from an MCP tool (show_probe_point) over SSE ──
+  // EventSource auto-reconnects on drop, so no manual reconnect logic is needed.
+  function highlightNet(net){
+    if(!net) return;
+    flashRow(net);                              // flash the net's row in the probe table
+    if(view){                                   // and pulse the board frame as a board-level cue
+      view.classList.remove('probe-pulse'); void view.offsetWidth; view.classList.add('probe-pulse');
+    }
+  }
+  try{
+    var es=new EventSource('/events');
+    es.addEventListener('message', function(ev){
+      var m; try{ m=JSON.parse(ev.data); }catch(_){ return; }
+      if(m && m.type==='probe_point' && m.net){ highlightNet(m.net); }
+    });
+    es.onerror=function(){ /* browser auto-reconnects */ };
+  }catch(_){}
+
   // ── kicanvas board: render, persist (IndexedDB), lazy on tab activation ──
   function deepFind(selector, root){
     root=root||document;
@@ -1297,6 +2077,94 @@ _PCB_BODY = r"""
 def pcb_page() -> RedirectResponse:
     # Board now lives in the single-page shell; keep the old URL working.
     return RedirectResponse("/#board", status_code=307)
+
+
+@app.get("/llm/providers")
+def llm_providers() -> dict:
+    """Configured LLM backends for the chat model picker. Secrets are never
+    included — only name/type/model, the saved global default, and this project's
+    pinned provider (teasel.toml [llm].provider). `effective` is what the chat
+    will actually use: the project pin if set, else the global default."""
+    default = st.get_default_provider()
+    project = st.load_project_provider(Path.cwd())
+    project_model = st.load_project_model(Path.cwd())
+    providers = list(st.load_providers().values())
+    out = [
+        {
+            "name": pc.name,
+            "type": pc.type,
+            "model": pc.model or "",
+            # A backend may expose several models (one key, many models); fall back
+            # to its single default model so every backend offers at least one.
+            "models": pc.models or ([pc.model] if pc.model else []),
+        }
+        for pc in providers
+    ]
+    eff_provider = project or default
+    eff = next((p for p in out if p["name"] == eff_provider), None)
+    eff_model = project_model or (eff["model"] if eff else "") \
+        or (eff["models"][0] if eff and eff["models"] else "")
+    return {
+        "default": default,
+        "project": project,
+        "effective": eff_provider,
+        "effective_model": eff_model,
+        "providers": out,
+    }
+
+
+@app.post("/llm/project-provider")
+async def set_project_provider(request: Request) -> dict:
+    """Pin this project's chat backend + model in teasel.toml ([llm] provider/model)
+    so it persists across sessions. The global default stays the fallback for
+    unpinned projects."""
+    body = await request.json()
+    name = (body.get("name") or "").strip()
+    model = (body.get("model") or "").strip()
+    if name and name not in st.load_providers():
+        return {"ok": False, "error": f"Unknown backend '{name}'."}
+    st.save_project_provider(name or None, Path.cwd(), model=model or None)
+    return {"ok": True, "provider": name or None, "model": model or None}
+
+
+@app.post("/llm/anthropic/models")
+async def anthropic_models(request: Request) -> dict:
+    """List models from the Anthropic API to populate the settings model picker.
+
+    The key comes from the form (just typed) or, when editing with the field left
+    blank, from the named saved backend. It's used only to call Anthropic and is
+    never logged or returned."""
+    import urllib.error
+    import urllib.request
+
+    body = await request.json()
+    key = (body.get("key") or "").strip()
+    if not key:
+        name = (body.get("name") or "").strip()
+        saved = st.load_providers().get(name) if name else None
+        key = saved.api_key if saved else ""
+    if not key:
+        return {"ok": False, "error": "No API key — enter one above first."}
+
+    req = urllib.request.Request(
+        "https://api.anthropic.com/v1/models?limit=1000",
+        headers={"x-api-key": key, "anthropic-version": "2023-06-01"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            data = json.loads(resp.read())
+    except urllib.error.HTTPError as e:
+        detail = "invalid API key" if e.code == 401 else f"HTTP {e.code}"
+        return {"ok": False, "error": f"Anthropic API: {detail}"}
+    except Exception as e:  # network/DNS/timeout
+        return {"ok": False, "error": f"Could not reach Anthropic API ({e})."}
+
+    models = [
+        {"id": m.get("id", ""), "display_name": m.get("display_name") or m.get("id", "")}
+        for m in data.get("data", [])
+        if m.get("id")
+    ]
+    return {"ok": True, "models": models}
 
 
 @app.get("/pcb/probes")
@@ -1441,8 +2309,6 @@ def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str
     datalist, list_attr = _node_datalist(nodes)
     html = datalist
     if inst.type == "function-generator":
-        amp = current.limits.get("amplitude_max", "")
-        freq = current.limits.get("frequency_max", "")
         fg_rows = ""
         for ch, ch_label in (("output", "Main"), ("ttl", "TTL")):
             lbl = current.channels.get(ch, {}).get("label", "")
@@ -1451,6 +2317,19 @@ def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str
           <input name="ch_{ch}_label" value="{lbl}" placeholder="—"{list_attr}>
           <button type="button" class="clear-x" title="Clear"
                   onclick="document.querySelector('[name=ch_{ch}_label]').value=''">×</button>"""
+        limit_inputs = ""
+        for key, label, kind in st.LIMIT_FIELDS:
+            val = current.limits.get(key, "")
+            if kind == "number":
+                limit_inputs += f"""
+          <label>{label}
+            <input name="limit_{key}" type="number" step="any" value="{val}" placeholder="no limit">
+          </label>"""
+            else:
+                limit_inputs += f"""
+          <label style="grid-column:1/-1">{label}
+            <input name="limit_{key}" value="{val}" placeholder="e.g. TLE2142 input abs-max ±15 V">
+          </label>"""
         html += f"""
         <div class="fg-grid">
           <div class="ch-hdr">Output</div>
@@ -1459,13 +2338,10 @@ def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str
           {fg_rows}
         </div>
         <div class="limit-row">
-          <label>Amplitude limit (Vpp)
-            <input name="limit_amplitude_max" type="number" step="any" value="{amp}" placeholder="no limit">
-          </label>
-          <label>Frequency limit (Hz)
-            <input name="limit_frequency_max" type="number" step="any" value="{freq}" placeholder="no limit">
-          </label>
-        </div>"""
+          {limit_inputs}
+        </div>
+        <small class="muted">Safety limits are enforced by teasel-server before any command reaches the
+          instrument — the assistant is refused, told why, and cannot override them.</small>"""
     if inst.type == "oscilloscope":
         rows = ""
         for ch in ("C1", "C2", "C3", "C4"):
@@ -1490,14 +2366,10 @@ def _setup_fields(inst: st.InstrumentConfig, current: st.InstrumentSetup) -> str
 
 
 def _save_setup(inst: st.InstrumentConfig, form) -> None:
-    limits: dict[str, float] = {}
-    for key in ("amplitude_max", "frequency_max"):
-        val = str(form.get(f"limit_{key}", "")).strip()
-        if val:
-            try:
-                limits[key] = float(val)
-            except ValueError:
-                pass
+    previous = next((s.limits for s in st.load_setup() if s.slug == inst.slug), {})
+    limits = st.limits_from_form(
+        {key: str(form.get(f"limit_{key}", "")) for key, _, _ in st.LIMIT_FIELDS}, previous,
+    )
 
     # Channels hold only bench tuning (label/probe). Net/role live in the per-board
     # probe map (project.toml [boards.*]), so there's nothing to merge here.
@@ -1571,6 +2443,13 @@ def llm_settings(saved: str = "", edit: str = "") -> HTMLResponse:
     url = editing.url if editing else "http://localhost:11434"
     base_url = editing.base_url if editing else ""
     model = editing.model if editing else ""
+    models = editing.models if editing else []
+    # Pre-render the saved models as selected options so editing shows the current
+    # set before any API fetch; "Load models from API" appends the rest.
+    anthropic_model_opts = "".join(
+        f'<option value="{m}" selected>{m}</option>' for m in models
+    )
+    hide_model = ' style="display:none"' if ptype == "anthropic" else ""
     token_ph = "•••• (kept if blank)" if editing and editing.token else "Cloudflare API token"
     key_ph = "•••• (kept if blank)" if editing and editing.api_key else "API key (blank if none)"
     model_ph = CLAUDE_DEFAULT_MODEL if ptype == "anthropic" else CF_DEFAULT_MODEL
@@ -1637,9 +2516,21 @@ def llm_settings(saved: str = "", edit: str = "") -> HTMLResponse:
       <div id="anthropic-fields"{hide("anthropic")}>
         <label>API Key <input name="anthropic_key" value="" placeholder="{key_ph}">
           <small class="muted">Anthropic API key. Leave blank to keep existing.</small></label>
+        <label>Models
+          <select name="anthropic_models" id="anthropic-model-list" multiple size="6" style="margin:0">
+            {anthropic_model_opts}
+          </select>
+          <small class="muted">Pick one or more (Ctrl/Cmd-click) — this backend's one key serves them all.
+            The first selected is the default. Use “Load models from API” to fetch the catalog.</small></label>
+        <div style="display:flex;align-items:center;gap:.6rem;flex-wrap:wrap;margin:-.2rem 0 .6rem">
+          <button type="button" class="outline" style="padding:.2rem .6rem;font-size:.78rem;width:auto;margin:0" onclick="loadAnthropicModels(this)">Load models from API</button>
+          <small id="anthropic-model-msg" class="muted" style="font-size:.74rem"></small>
+        </div>
       </div>
 
-      <label>Model <input name="model" value="{model}" placeholder="{model_ph}"></label>
+      <div id="model-field"{hide_model}>
+        <label>Model <input name="model" value="{model}" placeholder="{model_ph}"></label>
+      </div>
       <button type="submit">{submit_label}</button>
     </form>
     </article>
@@ -1653,8 +2544,36 @@ def llm_settings(saved: str = "", edit: str = "") -> HTMLResponse:
       document.getElementById('ollama-fields').style.display = t==='ollama'?'':'none';
       document.getElementById('oc-fields').style.display = t==='openai-compat'?'':'none';
       document.getElementById('anthropic-fields').style.display = t==='anthropic'?'':'none';
+      var mf=document.getElementById('model-field');
+      if(mf) mf.style.display = t==='anthropic' ? 'none' : '';
       var mi=document.querySelector('input[name=model]');
       if(mi) mi.placeholder = t==='anthropic' ? '{CLAUDE_DEFAULT_MODEL}' : t==='cloudflare' ? '{CF_DEFAULT_MODEL}' : 'model name';
+    }}
+    function loadAnthropicModels(btn){{
+      var keyEl=document.querySelector('input[name=anthropic_key]');
+      var nameEl=document.querySelector('input[name=name]');
+      var sel=document.getElementById('anthropic-model-list');
+      var msg=document.getElementById('anthropic-model-msg');
+      var payload={{ key:(keyEl&&keyEl.value.trim())||'', name:(nameEl&&nameEl.value.trim())||'' }};
+      if(!payload.key && !payload.name){{ msg.textContent='enter an API key first'; return; }}
+      btn.disabled=true; msg.textContent='loading…';
+      fetch('/llm/anthropic/models',{{method:'POST',headers:{{'Content-Type':'application/json'}},body:JSON.stringify(payload)}})
+        .then(function(r){{return r.json();}})
+        .then(function(d){{
+          btn.disabled=false;
+          if(!d.ok){{ msg.textContent=d.error||'failed'; return; }}
+          var have={{}};
+          Array.prototype.forEach.call(sel.options,function(o){{ have[o.value]=true; }});
+          var added=0;
+          d.models.forEach(function(m){{
+            if(have[m.id]){{ return; }}
+            var o=document.createElement('option'); o.value=m.id;
+            o.textContent=(m.display_name||m.id)+' ('+m.id+')';
+            sel.appendChild(o); added++;
+          }});
+          msg.textContent=d.models.length+' available — '+added+' added. Select the ones to enable.';
+        }})
+        .catch(function(){{ btn.disabled=false; msg.textContent='request failed'; }});
     }}
     </script>
     """
@@ -1683,6 +2602,10 @@ async def llm_settings_save(request: Request) -> RedirectResponse:
     elif ptype == "anthropic":
         key = str(form.get("anthropic_key", "")).strip()
         pc.api_key = key or (existing.api_key if existing else "")
+        models = [m.strip() for m in form.getlist("anthropic_models") if m.strip()]
+        pc.models = models
+        # First selected model is the backend's default; keep the old one if none picked.
+        pc.model = models[0] if models else (existing.model if existing else "")
     else:  # ollama
         pc.url = str(form.get("url", "")).strip()
 
